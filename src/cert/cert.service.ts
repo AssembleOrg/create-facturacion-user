@@ -1,9 +1,16 @@
 // src/cert/cert.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import * as forge from 'node-forge';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { config } from 'src/config/config';
+import Vault from 'node-vault';
 
 export interface PemPair {
   privateKey: string; // "-----BEGIN PRIVATE KEY-----\n…"
@@ -18,6 +25,16 @@ export interface PemPair {
 @Injectable()
 export class CertService {
   private readonly logger = new Logger(CertService.name);
+  private VAULT_ADDRESS = config.vaultAddress;
+  private VAULT_TOKEN = config.vaultToken;
+  private VAULT_CLIENT: Vault.client;
+  constructor() {
+    this.VAULT_CLIENT = Vault({
+      apiVersion: 'v1',
+      endpoint: this.VAULT_ADDRESS,
+      token: this.VAULT_TOKEN,
+    });
+  }
 
   /**
    * Genera un par de claves RSA de 2048 bits en formato PEM.
@@ -98,5 +115,54 @@ export class CertService {
     this.logger.log(`Wrote CSR to         ${csrPath}`);
 
     return { keyPath, csrPath };
+  }
+
+  /**
+   * Graba la clave y certificado del usuario en Vault
+   */
+  async loadUserCertificateAndKey(
+    userId: string,
+    key: string,
+    cert: string,
+  ): Promise<void> {
+    try {
+      const path = `secret/data/certificate/${userId}`;
+      await this.VAULT_CLIENT.write(path, {
+        data: { key, cert },
+      });
+    } catch (error: any) {
+      // Puedes personalizar el mensaje según el error que devuelva Vault
+      throw new InternalServerErrorException(
+        `Error escribiendo en Vault: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Lee la clave y certificado del usuario desde Vault
+   */
+  async getUserCertificateAndKey(
+    userId: string,
+  ): Promise<{ key: string; cert: string }> {
+    try {
+      const path = `secret/data/certificate/${userId}`;
+      const result = await this.VAULT_CLIENT.read(path);
+
+      // En Vault KV v2, los datos suelen estar en result.data.data
+      if (!result || !result.data || !result.data.data) {
+        throw new NotFoundException('Certificado no encontrado');
+      }
+      this.logger.log('Resultado de getUserCertificateAndKey', result);
+      const data = result.data.data as { key: string; cert: string };
+      return data;
+    } catch (err: any) {
+      if (err.response && err.response.statusCode === 404) {
+        // Si Vault devuelve 404 en su API
+        throw new NotFoundException('Certificado no encontrado');
+      }
+      throw new InternalServerErrorException(
+        `Error leyendo de Vault: ${err.message}`,
+      );
+    }
   }
 }

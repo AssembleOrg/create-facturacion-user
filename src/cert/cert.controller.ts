@@ -1,4 +1,3 @@
-// src/cert/cert.controller.ts
 import {
   Controller,
   Post,
@@ -9,6 +8,9 @@ import {
   BadRequestException,
   Header,
   Logger,
+  HttpCode,
+  HttpStatus,
+  ParseIntPipe,
 } from '@nestjs/common';
 import { Response } from 'express';
 import {
@@ -21,8 +23,22 @@ import {
   ApiProduces,
   ApiConsumes,
   ApiBody,
+  ApiInternalServerErrorResponse,
+  ApiNotFoundResponse,
 } from '@nestjs/swagger';
 import { CertService } from './cert.service';
+import { LoadCertificateDto } from './dto/load-certificate.dto';
+import { GetCertificateResponseDto } from './dto/get-certificate.dto';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
+import { join } from 'path';
 
 /**
  * DTO para el endpoint POST /cert/generate
@@ -129,8 +145,57 @@ export class CertController {
     const normalizedPrivateKey = privateKeyPem.replace(/\r\n/g, '\n');
     const normalizedCsr = csrPem.replace(/\r\n/g, '\n');
 
+    const uploadsDir = join(process.cwd(), 'static', 'uploads');
+
+    if (existsSync(uploadsDir)) {
+      // Leer todo lo que haya dentro de uploadsDir
+      const entries = readdirSync(uploadsDir);
+
+      for (const entry of entries) {
+        const fullPath = join(uploadsDir, entry);
+        const stats = statSync(fullPath);
+
+        if (stats.isDirectory()) {
+          // Si es un subdirectorio, lo borramos recursivamente
+          rmSync(fullPath, { recursive: true, force: true });
+        } else {
+          // Si es un archivo, lo borramos
+          unlinkSync(fullPath);
+        }
+      }
+      this.logger.log(`Se vació el contenido de: ${uploadsDir}`);
+    } else {
+      // Si no existía, lo creamos
+      mkdirSync(uploadsDir, { recursive: true });
+      this.logger.log(`Creado directorio: ${uploadsDir}`);
+    }
+
+    // 7) Definir un nombre de archivo único para el CSR
+    //    Por ejemplo: "CN-serial-<timestamp>.csr"
+    const csrFilename = `csr-creado.pem`;
+    const keyFilename = `key-creado.pem`;
+
+    // 8) Ruta completa al archivo .csr
+    const csrFilepath = join(uploadsDir, csrFilename);
+    const keyFilepath = join(uploadsDir, keyFilename);
+
+    // 9) Escribir el CSR en disco
+    try {
+      writeFileSync(csrFilepath, normalizedCsr, { encoding: 'utf8' });
+      writeFileSync(keyFilepath, normalizedPrivateKey, { encoding: 'utf8' });
+      this.logger.log(`CSR guardado en: ${csrFilepath}`);
+    } catch (err) {
+      this.logger.error(
+        `Error al escribir CSR en disco (${csrFilepath}):`,
+        (err as Error).message,
+      );
+      throw new BadRequestException(
+        `No se pudo guardar el CSR en servidor: ${(err as Error).message}`,
+      );
+    }
+
     this.logger.log(
-      `Generated in-memory key+CSR for CN=${commonName}, SN=${serialNumber}`,
+      `Generado en memoria key+CSR para CN=${commonName}, SN=${serialNumber}`,
     );
     return {
       privateKey: normalizedPrivateKey,
@@ -246,5 +311,59 @@ export class CertController {
 
     // Si llegan aquí, type no era válido
     throw new BadRequestException('type inválido. Use "key" o "csr".');
+  }
+
+  @Post()
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Carga clave y certificado del usuario en Vault' })
+  @ApiResponse({
+    status: 201,
+    description: 'Certificado cargado correctamente.',
+  })
+  @ApiBadRequestResponse({ description: 'Parámetros inválidos.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Error escribiendo en Vault.',
+  })
+  async loadCertificate(
+    @Body() loadDto: LoadCertificateDto,
+  ): Promise<{ message: string }> {
+    const { userId, key, cert } = loadDto;
+    // Validación adicional (aunque class-validator ya verifica strings no vacíos)
+    if (!userId || !key || !cert) {
+      throw new BadRequestException('Faltan parámetros');
+    }
+
+    await this.certService.loadUserCertificateAndKey(userId, key, cert);
+    return { message: 'Certificate loaded' };
+  }
+
+  @Get(':userId')
+  @ApiOperation({
+    summary: 'Obtiene clave y certificado del usuario desde Vault',
+  })
+  @ApiParam({
+    name: 'userId',
+    description: 'ID del usuario (número)',
+    example: 123,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Certificado obtenido correctamente.',
+    type: GetCertificateResponseDto,
+  })
+  @ApiBadRequestResponse({ description: 'userId inválido.' })
+  @ApiNotFoundResponse({ description: 'Certificado no encontrado.' })
+  @ApiInternalServerErrorResponse({ description: 'Error leyendo de Vault.' })
+  async getCertificate(
+    @Param('userId', ParseIntPipe) userId: number,
+  ): Promise<GetCertificateResponseDto> {
+    if (!userId) {
+      // ParseIntPipe ya lanzará BadRequestException si no es número
+      throw new BadRequestException('Invalid userId');
+    }
+    const data = await this.certService.getUserCertificateAndKey(
+      userId.toString(),
+    );
+    return { key: data.key, cert: data.cert };
   }
 }
