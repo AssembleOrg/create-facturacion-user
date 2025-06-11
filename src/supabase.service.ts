@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
 import { config } from 'src/config/config';
 import { Database } from './types/supabase.types';
 
@@ -67,6 +67,22 @@ export class SupabaseService {
     }
 
     this.logger.log('Updated updated_at in facturacion_users');
+  }
+
+  async verifyToken(token: string): Promise<{
+    user: User;
+  }> {
+    const { data, error } = await this.supabase.auth.getUser(token);
+    if (error) {
+      this.logger.error(error.message);
+      throw new BadRequestException(error.message);
+    }
+
+    if (data.user === null) {
+      throw new BadRequestException('Token no valido');
+    }
+
+    return data;
   }
 
   async getFacturacionUsers(): Promise<

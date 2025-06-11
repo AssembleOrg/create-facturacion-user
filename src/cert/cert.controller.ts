@@ -11,6 +11,7 @@ import {
   HttpCode,
   HttpStatus,
   ParseIntPipe,
+  UseGuards,
 } from '@nestjs/common';
 import { Response } from 'express';
 import {
@@ -39,6 +40,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { join } from 'path';
+import { AuthGuard } from 'src/guards/auth.guard';
 
 /**
  * DTO para el endpoint POST /cert/generate
@@ -59,6 +61,7 @@ class GenerateDto {
 
 @ApiTags('cert')
 @Controller('cert')
+@UseGuards(AuthGuard)
 export class CertController {
   private readonly logger = new Logger(CertController.name);
 

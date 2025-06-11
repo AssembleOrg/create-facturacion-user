@@ -1,7 +1,14 @@
-import { Controller, Get, Param, BadRequestException } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  BadRequestException,
+  UseGuards,
+} from '@nestjs/common';
 import { AppService } from './app.service';
 import { SupabaseService } from './supabase.service';
 import { Database } from './types/supabase.types';
+import { AuthGuard } from './guards/auth.guard';
 
 @Controller()
 export class AppController {
@@ -10,12 +17,15 @@ export class AppController {
     private readonly supabaseService: SupabaseService,
   ) {}
 
-  @Get()
-  getHello(): string {
-    return this.appService.getHello();
+  @Get('status')
+  getHello(): { status: string } {
+    return {
+      status: 'ok',
+    };
   }
 
   @Get('facturacion_users')
+  @UseGuards(AuthGuard)
   async getAllFacturacionUsers(): Promise<
     Database['public']['Tables']['facturacion_users']['Row'][]
   > {
@@ -23,6 +33,7 @@ export class AppController {
   }
 
   @Get('facturacion_user/:username')
+  @UseGuards(AuthGuard)
   async getFacturacionUser(
     @Param('username') username: string,
   ): Promise<Database['public']['Tables']['facturacion_users']['Row']> {

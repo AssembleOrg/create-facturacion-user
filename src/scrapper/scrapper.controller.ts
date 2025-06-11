@@ -4,6 +4,7 @@ import {
   Get,
   Logger,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import { ScrapperService } from './scrapper.service';
 import {
@@ -12,8 +13,10 @@ import {
   ApiOperation,
   ApiQuery,
 } from '@nestjs/swagger';
+import { AuthGuard } from 'src/guards/auth.guard';
 
 @Controller('scrapper')
+@UseGuards(AuthGuard)
 export class ScrapperController {
   private readonly logger = new Logger('ScrapperController');
 
