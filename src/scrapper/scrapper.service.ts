@@ -4,6 +4,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  NotFoundException,
 } from '@nestjs/common';
 import puppeteer, {
   Browser,
@@ -18,6 +19,9 @@ import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs';
 import Afip from '@afipsdk/afip.js';
 import { config } from 'src/config/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { JobEntity } from 'src/job.entity';
+import { Repository } from 'typeorm';
 
 @Injectable()
 export class ScrapperService {
@@ -32,11 +36,55 @@ export class ScrapperService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly cerService: CertService,
+    @InjectRepository(JobEntity)
+    private readonly jobRepository: Repository<JobEntity>,
   ) {
     // Constructor remains synchronous. Initialization is handled separately.
   }
 
-  public async createCertificateAndPersistUser(usuario?: string): Promise<{
+  async createCertificateAndPersistUser(
+    username: string,
+  ): Promise<{ jobId: number }> {
+    const job = await this.jobRepository.save({ username, status: 'pending' });
+
+    // Lanza en segundo plano
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    this.runJobInBackground(job.id, username);
+
+    return { jobId: job.id };
+  }
+
+  private async runJobInBackground(jobId: number, username: string) {
+    try {
+      await this.runScrapperLogic(username);
+
+      // ✅ Guardar resultado como quieras (si querés persistir cert/key/salesPoints)
+      await this.jobRepository.update(jobId, {
+        status: 'success',
+      });
+
+      this.logger.log(`✔️ Job #${jobId} completado`);
+    } catch (error) {
+      this.logger.error(`❌ Job #${jobId} falló: ${error.message}`);
+      await this.jobRepository.update(jobId, {
+        status: 'error',
+        error: error.message,
+      });
+    }
+  }
+
+  public async getJob(id: number): Promise<JobEntity> {
+    const job = await this.jobRepository.findOne({
+      where: { id },
+    });
+
+    if (!job) {
+      throw new NotFoundException('No se encontró el job');
+    }
+    return job;
+  }
+
+  private async runScrapperLogic(usuario?: string): Promise<{
     cert: string;
     key: string;
     salesPoints: number[] | string[];
@@ -46,6 +94,40 @@ export class ScrapperService {
         const user = await this.supabaseService.getFacturacionUser(usuario);
         const downloadsDir = join(process.cwd(), 'static', 'downloads');
         const uploadsDir = join(process.cwd(), 'static', 'uploads');
+
+        const updatedAt = new Date(user.updated_at); // asegura que es un Date
+        const now = new Date();
+        const twoWeeksAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+
+        console.log('🕰️ updatedAt:', updatedAt.toISOString());
+        console.log('🧮 twoWeeksAgo:', twoWeeksAgo.toISOString());
+
+        if (updatedAt > twoWeeksAgo) {
+          const { cert, key } = await this.cerService.getUserCertificateAndKey(
+            String(user.id),
+          );
+
+          const cuitOnlyNumber = user.username?.replace(/-/g, '');
+          const afip = new Afip({
+            CUIT: cuitOnlyNumber,
+            cert,
+            key,
+            production: true,
+            access_token: config.afipSdkToken,
+          });
+          const salesPoints: string[] | number[] =
+            await afip.ElectronicBilling.getSalesPoints();
+
+          if (!salesPoints || salesPoints.length === 0) {
+            throw new BadRequestException('No se encontró punto de venta');
+          }
+
+          return {
+            cert,
+            key,
+            salesPoints,
+          };
+        }
 
         if (existsSync(downloadsDir)) {
           // Leer todo lo que haya dentro de downloadsDir
@@ -376,10 +458,10 @@ export class ScrapperService {
       // await new Promise((resolve) => setTimeout(resolve, 300_000));
       const multipleDropdown = '#tblAutoridadAplicacion_cmbCont';
       try {
-        await newPage.waitForSelector(multipleDropdown, { timeout: 16000 });
+        await newPage.waitForSelector(multipleDropdown, { timeout: 10_000 });
         await newPage.select(multipleDropdown, cuit);
         await newPage.waitForSelector('#cmdNuevaRelacion', {
-          timeout: 16_000,
+          timeout: 10_000,
         });
         await newPage.click('#cmdNuevaRelacion');
       } catch (e) {
@@ -388,8 +470,14 @@ export class ScrapperService {
           e,
           'Running Single Alias',
         );
+
+        await newPage.waitForSelector('#cmdNuevaRelacion', {
+          timeout: 10_000,
+        });
+        await newPage.click('#cmdNuevaRelacion');
+
         await newPage.waitForSelector('#tblDetalleRelacion_lblRepresentado', {
-          timeout: 16_000,
+          timeout: 10_000,
         });
 
         const text = await newPage.$eval(
@@ -406,58 +494,89 @@ export class ScrapperService {
             'El usuario debe activar la representación hacía su persona juridica',
           );
         }
-
-        await newPage.waitForSelector('#cmdNuevaRelacion', {
-          timeout: 16_000,
-        });
-        await newPage.click('#cmdNuevaRelacion');
       }
 
+      this.logger.warn('LLEGANDO A SERVICIO');
       await new Promise((resolve) => setTimeout(resolve, 10_000));
 
       const cmdBuscarServicio = '#cmdBuscarServicio';
       await newPage.waitForSelector(cmdBuscarServicio, {
-        timeout: 16_000,
+        timeout: 10_000,
       });
       await newPage.click(cmdBuscarServicio);
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
 
-      await newPage.waitForSelector(
-        'img[alt="Agencia de Recaudación y Control Aduanero"]',
-        { visible: true },
-      );
+      await newPage.evaluate(() => {
+        const img = document.querySelector(
+          'img[alt="Agencia de Recaudación y Control Aduanero"]',
+        );
+        if (img) {
+          img.scrollIntoView({ behavior: 'auto', block: 'center' });
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
       await newPage.click(
         'img[alt="Agencia de Recaudación y Control Aduanero"]',
       );
 
-      const [webServicesTd] = await newPage.$$(
-        "xpath/.//td[text()='WebServices']",
-      );
-      if (!webServicesTd) {
-        this.logger.error('No se encontró el <td> con texto "WebServices"');
-        throw new ConflictException(
-          'No se encontró el <td> con texto "WebServices"',
+      // await new Promise((resolve) => setTimeout(resolve, 5_000));
+
+      // await newPage.waitForSelector('#ctrl\\.afip', {
+      //   visible: true,
+      //   timeout: 5000,
+      // });
+
+      // await newPage.click('#ctrl\\.afip');
+      // this.logger.warn('CLICKIE A SERVICIO');
+
+      // await newPage.waitForSelector('#ctrl\\.org\\.afip\\.grp\\.webservices', {
+      //   visible: true,
+      //   timeout: 5000,
+      // });
+
+      // await newPage.click('#ctrl\\.org\\.afip\\.grp\\.webservices');
+
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      await newPage.evaluate(() => {
+        const td = Array.from(document.querySelectorAll('td')).find(
+          (el) => el.textContent?.trim() === 'WebServices',
         );
-      }
+        if (td) {
+          console.warn('CLICKIE SERVICE');
+          td.click();
+        }
+        if (!td)
+          throw new BadRequestException(
+            'No se encontró el enlace "WebServices"',
+          );
+      });
+      this.logger.warn('LLEGANDO A FACTURACION');
 
-      await webServicesTd.click();
+      await newPage.waitForSelector('#ctrl\\.org\\.afip\\.grp\\.webservices', {
+        visible: true,
+        timeout: 5000,
+      });
 
-      const [feLink] = await newPage.$$(
-        "xpath/.//a[text()='Facturación Electrónica']",
-      );
-      if (!feLink) {
-        this.logger.error('No se encontró el enlace "Facturación Electrónica"');
-        throw new ConflictException(
-          'No se encontró el enlace "Facturación Electrónica"',
-        );
-      }
+      await newPage.click('#ctrl\\.org\\.afip\\.grp\\.webservices');
 
-      this.logger.verbose('LLEGUE HASTA LINK', feLink);
-      await feLink.click();
+      await newPage.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('td a'));
+        const feLink = links.find((el) =>
+          el.textContent?.includes('Facturación Electrónica'),
+        ) as HTMLElement | null;
 
+        if (!feLink) {
+          throw new Error(
+            '❌ No se encontró el link "Facturación Electrónica"',
+          );
+        }
+        feLink.scrollIntoView({ behavior: 'auto', block: 'center' });
+        feLink.click();
+      });
       const cmdBuscarUsuario = '#cmdBuscarUsuario';
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       await newPage.waitForSelector(cmdBuscarUsuario, {
-        timeout: 16_000,
+        timeout: 10_000,
         visible: true,
       });
       await newPage.click(cmdBuscarUsuario);
@@ -479,14 +598,14 @@ export class ScrapperService {
 
       const cmdSeleccionarServicio = '#cmdSeleccionarServicio';
       await newPage.waitForSelector(cmdSeleccionarServicio, {
-        timeout: 16_000,
+        timeout: 10_000,
         visible: true,
       });
       await newPage.click(cmdSeleccionarServicio);
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       const cmdGenerarRelacion = '#cmdGenerarRelacion';
       await newPage.waitForSelector(cmdGenerarRelacion, {
-        timeout: 16_000,
+        timeout: 10_000,
         visible: true,
       });
       await newPage.click(cmdGenerarRelacion);
@@ -496,7 +615,7 @@ export class ScrapperService {
         throw error;
       }
       this.logger.error('Error in addServiceRelacion:', error);
-      throw new ConflictException('Error in addServiceRelacion');
+      throw new ConflictException(error.message);
     }
   }
 
@@ -506,7 +625,7 @@ export class ScrapperService {
       await page.waitForFunction(() => document.readyState === 'complete');
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       await page.waitForSelector('#buscadorInput', {
-        timeout: 16_000,
+        timeout: 12_000,
       });
       await page.type('#buscadorInput', serviceName);
       await page.click('#rbt-menu-item-0');
@@ -547,24 +666,24 @@ export class ScrapperService {
           e,
           'Running Single Alias',
         );
-        await page.waitForSelector('#tblDetalleRelacion_lblRepresentado', {
-          timeout: 16_000,
-        });
+        // await page.waitForSelector('#tblDetalleRelacion_lblRepresentado', {
+        //   timeout: 16_000,
+        // });
 
-        const text = await page.$eval(
-          '#tblDetalleRelacion_lblRepresentado',
-          (el) => el.textContent?.trim() || '',
-        );
+        // const text = await page.$eval(
+        //   '#tblDetalleRelacion_lblRepresentado',
+        //   (el) => el.textContent?.trim() || '',
+        // );
 
-        this.logger.fatal(text);
+        // this.logger.fatal(text);
 
-        const usernameToCuit = `[${cuit.slice(0, 2)}-${cuit.slice(2, 10)}-${cuit.slice(10)}]`;
+        // const usernameToCuit = `[${cuit.slice(0, 2)}-${cuit.slice(2, 10)}-${cuit.slice(10)}]`;
 
-        if (!text.includes(usernameToCuit)) {
-          throw new BadRequestException(
-            'El usuario debe activar la representación hacía su persona juridica',
-          );
-        }
+        // if (!text.includes(usernameToCuit)) {
+        //   throw new BadRequestException(
+        //     'El usuario debe activar la representación hacía su persona juridica',
+        //   );
+        // }
 
         await page.waitForSelector('#cmdIngresar', {
           timeout: 20_000,
@@ -672,7 +791,7 @@ export class ScrapperService {
       );
 
       await page.waitForSelector('input[alt="Descargar"]', {
-        timeout: 20_000,
+        timeout: 40_000,
         visible: true,
       });
       await page.click('input[alt="Descargar"]');
@@ -770,7 +889,7 @@ export class ScrapperService {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
         await page.waitForSelector(idCaptcha, { timeout: 10_000 });
 
-        throw new ConflictException('Captcha activation');
+        throw new ConflictException('Captcha activado');
       } catch (e) {
         if (e instanceof ConflictException) {
           this.logger.error(e.message);
