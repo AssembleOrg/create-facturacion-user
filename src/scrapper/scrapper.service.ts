@@ -32,6 +32,7 @@ export class ScrapperService {
   private currentAlias: string;
   private currentSalePoint: number;
   private loggedIn: boolean;
+  private currentCertificatePage: Page;
 
   constructor(
     private readonly supabaseService: SupabaseService,
@@ -254,10 +255,11 @@ export class ScrapperService {
         'No se pudo iniciar sesión en AFIP',
       );
     }
-    // await new Promise((resolve) => setTimeout(resolve, 500_000));
+    
     await this.goToCertificadosDigitales(newPage);
 
-    const pageAlias = await this.getNewPage(this.browser);
+    // Usar la página de certificados que se abrió, o obtener una nueva si es necesario
+    const pageAlias = this.currentCertificatePage || await this.getNewPage(this.browser);
     const today = new Date();
     const miliseconds = today.getTime();
     this.currentAlias = `new-csr-${miliseconds}`;
@@ -464,6 +466,12 @@ export class ScrapperService {
           timeout: 10_000,
         });
         await newPage.click('#cmdNuevaRelacion');
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        const cboRepresentado = '#cboRepresentado';
+        await newPage.waitForSelector(cboRepresentado, {
+          timeout: 3_000,
+        });
+        await newPage.select(cboRepresentado, cuit);
       } catch (e) {
         this.logger.warn(
           'No se encontró el selector',
@@ -807,58 +815,184 @@ export class ScrapperService {
   private async getNewPage(browser: Browser): Promise<Page> {
     try {
       this.logger.log('Opening new page...');
-      const newPagePromise: Promise<Page> = new Promise((resolve, reject) => {
-        const timeout = setTimeout(
-          () => reject(new ConflictException('Timeout waiting for new page')),
-          10_000, // Increased timeout for new page creation
-        );
-
-        browser.once('targetcreated', (target) => {
-          void (async () => {
-            clearTimeout(timeout);
-            const page = await target.page();
-            if (!page) {
-              reject(new ConflictException('Page is null'));
-            } else {
-              resolve(page);
-            }
-          })();
-        });
-      });
-
-      this.logger.debug('Waiting for new page...');
-      const newPageC: Page = await newPagePromise;
-      this.logger.debug('New page created...');
-
-      // if you know the page needs additional time to load fully, use a fixed delay
-      await new Promise((resolve) => setTimeout(resolve, 4_000));
-
-      this.logger.log('New page opened...');
-
-      return newPageC;
+      const p = await this.waitForNewPage(browser, { timeoutMs: 12_000, mustHaveOpener: true });
+      if (!p) throw new ConflictException('Timeout waiting for new page');
+      await p.bringToFront().catch(() => {});
+      await p.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
+      this.logger.log('New page opened.');
+      return p;
     } catch (error) {
       this.logger.error('Error in getNewPage:', error);
       throw new ConflictException('Error in getNewPage');
     }
   }
 
+  /** Espera una nueva Page creada después de registrarse (sin carreras). */
+  private waitForNewPage(
+    browser: Browser,
+    opts: { timeoutMs?: number; mustHaveOpener?: boolean; urlPredicate?: (u: string) => boolean } = {}
+  ): Promise<Page | null> {
+    const { timeoutMs = 12_000, mustHaveOpener = true, urlPredicate } = opts;
+
+    return new Promise((resolve) => {
+      const onCreated = async (t: any) => {
+        try {
+          if (t.type() !== 'page') return;
+          if (mustHaveOpener && !t.opener()) return;
+          const p = await t.page();
+          if (!p) return;
+          if (urlPredicate && !urlPredicate(t.url())) return;
+          cleanup();
+          resolve(p);
+        } catch {
+          /* seguir escuchando */
+        }
+      };
+
+      const timer = setTimeout(() => { cleanup(); resolve(null); }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        browser.off('targetcreated', onCreated);
+      };
+
+      browser.on('targetcreated', onCreated);
+    });
+  }
+
+  /** Click por texto visible dentro de un contenedor, con click real (no $$eval). */
+  private async clickButtonByText(
+    page: Page,
+    containerSel: string,
+    targetText: string
+  ): Promise<boolean> {
+    const normalize = (s: string) =>
+      (s || '')
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+
+    const container = await page.$(containerSel);
+    if (!container) return false;
+
+    const buttons = await page.$$(containerSel + ' button, ' + containerSel + ' .btn');
+    const target = normalize(targetText);
+
+    for (const btn of buttons) {
+      const [txt, visible] = await Promise.all([
+        page.evaluate(el => (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase(), btn),
+        page.evaluate((el) => {
+          const cs = getComputedStyle(el as HTMLElement);
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return cs.visibility !== 'hidden' && cs.display !== 'none' && r.width > 0 && r.height > 0;
+        }, btn),
+      ]);
+      if (!visible) { await btn.dispose(); continue; }
+      // tolerá "más" / "mas"
+      if (normalize(txt) === target) {
+        await btn.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center' }));
+        await btn.click({ delay: 30 });  // gesto real
+        await btn.dispose();
+        return true;
+      }
+      await btn.dispose();
+    }
+    return false;
+  }
+
+  /** Maneja modal si existe; puede además esperar popup si el botón lo abre. */
+  private async handleModalIfPresent(
+    page: Page,
+    buttonText: string,
+    browser?: Browser,                 // si pasás browser, esperará popup
+    opts: { timeoutMs?: number } = {}
+  ): Promise<Page | null> {
+    const { timeoutMs = 12_000 } = opts;
+
+    // pequeño margen para aparición/animación
+    await new Promise(res => setTimeout(res, 600));
+
+    const modal = await page.$('.modal-content');
+    if (!modal) {
+      this.logger.log(`No se encontró modal para "${buttonText}"`);
+      return null;
+    }
+
+    this.logger.log(`Modal encontrada, buscando botón "${buttonText}"...`);
+
+    let waitPopup: Promise<Page | null> | null = null;
+    if (browser) waitPopup = this.waitForNewPage(browser, { timeoutMs, mustHaveOpener: true });
+
+    const clicked = await this.clickButtonByText(page, '.modal-content', buttonText);
+    if (!clicked) {
+      this.logger.log(`Botón "${buttonText}" no encontrado o no visible`);
+      return null;
+    }
+
+    this.logger.log(`Botón "${buttonText}" clickeado`);
+    await new Promise(res => setTimeout(res, 500)); // cierre de modal/animación
+
+    let popup: Page | null = null;
+    if (waitPopup) {
+      popup = await waitPopup;
+      if (popup) {
+        try { await popup.bringToFront(); } catch {}
+        try { await popup.waitForSelector('body', { timeout: 10_000 }); } catch {}
+      }
+    }
+    return popup;
+  }
+
+  /** Flujo completo. Devuelve la nueva Page si se abre en popup; null si navega in-tab. */
   private async goToCertificadosDigitales(page: Page): Promise<void> {
     try {
-      this.logger.log(
-        'Navigating to Administración de Certificados Digitales...',
-      );
+      this.logger.log('Navigating to Administración de Certificados Digitales...');
+
       await page.waitForFunction(() => document.readyState === 'complete');
-      await new Promise((resolve) => setTimeout(resolve, 3_000));
-      await page.waitForSelector('#buscadorInput', {
-        timeout: 16_000,
-      });
-      await page.type(
-        '#buscadorInput',
-        'Administración de Certificados Digitales',
-      );
-      await page.click('#rbt-menu-item-0');
+      await new Promise(res => setTimeout(res, 500));
+
+      // Modal "Recordar más tarde" (no abre popup → no pasamos browser aquí)
+      await this.handleModalIfPresent(page, 'recordar mas tarde');
+
+      // Buscador
+      await page.waitForSelector('#buscadorInput', { timeout: 30_000 });
+      await page.click('#buscadorInput', { delay: 20 });
+      const isMac = await page.evaluate(() => navigator.platform.includes('Mac'));
+      await page.keyboard.down(isMac ? 'Meta' : 'Control');
+      await page.keyboard.press('KeyA');
+      await page.keyboard.up(isMac ? 'Meta' : 'Control');
+      await page.type('#buscadorInput', 'Administración de Certificados Digitales', { delay: 50 });
+
+      await page.waitForSelector('#rbt-menu-item-0', { timeout: 15_000 });
+
+      // 1) Intento 1: el click del resultado abre popup
+      let waitPopup = this.waitForNewPage(this.browser, { timeoutMs: 12_000, mustHaveOpener: true });
+      await page.click('#rbt-menu-item-0', { delay: 30 });
+
+      let newPage = await waitPopup;
+
+      // 2) Si no hubo popup, puede aparecer una modal de confirmación que SÍ lo abre
+      if (!newPage) {
+        this.logger.log('No hubo popup tras seleccionar el resultado; verifico modal "Continuar"...');
+        newPage = await this.handleModalIfPresent(page, 'continuar', this.browser, { timeoutMs: 12_000 });
+
+        // 3) Si tampoco hubo popup, esperá navegación en la misma pestaña (fallback)
+        if (!newPage) {
+          await Promise.race([
+            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 8_000 }).catch(() => null),
+            new Promise(res => setTimeout(res, 1200)),
+          ]);
+        }
+      }
+
+      if (newPage) {
+        this.logger.log('Nueva pestaña abierta para Certificados Digitales');
+        // Guardar la nueva página para uso posterior
+        this.currentCertificatePage = newPage;
+      } else {
+        this.logger.log('Navegación a Certificados Digitales completada (misma pestaña)');
+      }
+
     } catch (error) {
-      console.error('Error navigating to Portal IVA:', error);
+      this.logger.error('Error navigating to Portal IVA:', error);
       throw new ConflictException('Error navigating to Portal IVA');
     }
   }
