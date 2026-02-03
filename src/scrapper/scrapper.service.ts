@@ -17,8 +17,6 @@ import { SupabaseService } from 'src/supabase.service';
 import { CertService } from 'src/cert/cert.service';
 import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs';
-import Afip from '@afipsdk/afip.js';
-import { config } from 'src/config/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { JobEntity } from 'src/job.entity';
 import { Repository } from 'typeorm';
@@ -108,25 +106,14 @@ export class ScrapperService {
             String(user.id),
           );
 
-          const cuitOnlyNumber = user.username?.replace(/-/g, '');
-          const afip = new Afip({
-            CUIT: cuitOnlyNumber,
-            cert,
-            key,
-            production: true,
-            access_token: config.afipSdkToken,
-          });
-          const salesPoints: string[] | number[] =
-            await afip.ElectronicBilling.getSalesPoints();
-
-          if (!salesPoints || salesPoints.length === 0) {
+          if (!user.salePoint) {
             throw new BadRequestException('No se encontró punto de venta');
           }
 
           return {
             cert,
             key,
-            salesPoints,
+            salesPoints: [user.salePoint],
           };
         }
 
@@ -146,10 +133,16 @@ export class ScrapperService {
           user.real_name!,
         );
         if (!this.currentAlias || !this.currentSalePoint) {
+          this.logger.error(
+            `Alias o punto de venta no encontrado. Alias: ${this.currentAlias}, SalePoint: ${this.currentSalePoint}`,
+          );
           throw new BadRequestException(
-            ' Alias o punto de venta no encontrado',
+            `Alias o punto de venta no encontrado. Alias: ${this.currentAlias || 'no establecido'}, Punto de venta: ${this.currentSalePoint || 'no establecido'}`,
           );
         }
+        this.logger.log(
+          `Configuración completada. Alias: ${this.currentAlias}, Punto de venta: ${this.currentSalePoint}`,
+        );
         this.logger.verbose('GO TO UPDATEAT', user.username);
         await this.supabaseService.updateUpdatedAt(user.username!);
         this.logger.verbose('GO TO UPDATE', user.username);
@@ -193,25 +186,14 @@ export class ScrapperService {
           String(user.id),
         );
 
-        const cuitOnlyNumber = user.username?.replace(/-/g, '');
-        const afip = new Afip({
-          CUIT: cuitOnlyNumber,
-          cert,
-          key,
-          production: true,
-          access_token: config.afipSdkToken,
-        });
-        const salesPoints: string[] | number[] =
-          await afip.ElectronicBilling.getSalesPoints();
-
-        if (!salesPoints || salesPoints.length === 0) {
+        if (!this.currentSalePoint) {
           throw new BadRequestException('No se encontró punto de venta');
         }
 
         return {
           cert,
           key,
-          salesPoints,
+          salesPoints: [this.currentSalePoint],
         };
       }
 
@@ -255,11 +237,12 @@ export class ScrapperService {
         'No se pudo iniciar sesión en AFIP',
       );
     }
-    
+
     await this.goToCertificadosDigitales(newPage);
 
     // Usar la página de certificados que se abrió, o obtener una nueva si es necesario
-    const pageAlias = this.currentCertificatePage || await this.getNewPage(this.browser);
+    const pageAlias =
+      this.currentCertificatePage || (await this.getNewPage(this.browser));
     const today = new Date();
     const miliseconds = today.getTime();
     this.currentAlias = `new-csr-${miliseconds}`;
@@ -367,15 +350,19 @@ export class ScrapperService {
           tblmiGrilla_totalRecords,
         );
 
+        this.logger.log(`Total de registros encontrados: ${totalRecords}`);
+
         const [btn] = await newPage.$$(
           `xpath/ .//span[@class="ui-button-text" and normalize-space(text())="Agregar.."]`,
         );
         if (!btn) {
+          this.logger.error('No se encontró el botón "Agregar.."');
           throw new ConflictException('No se encontró el botón "Agregar.."');
         }
 
         // Haz click en el <span> encontrado
         await btn.click();
+        this.logger.log('Click en botón Agregar realizado');
 
         await new Promise((resolve) => setTimeout(resolve, 3_000));
 
@@ -383,32 +370,38 @@ export class ScrapperService {
         await newPage.waitForSelector(frmAlta_pveNro, {
           timeout: 16_000,
         });
-        await newPage.type(frmAlta_pveNro, (totalRecords + 1).toString());
-
-        this.currentSalePoint = totalRecords + 1;
+        const nuevoPuntoVenta = totalRecords + 1;
+        await newPage.type(frmAlta_pveNro, nuevoPuntoVenta.toString());
+        this.logger.log(
+          `Tipeando número de punto de venta: ${nuevoPuntoVenta}`,
+        );
 
         const frmAlta_sisCodigo = '#frmAlta_sisCodigo';
         await newPage.waitForSelector(frmAlta_sisCodigo, {
           timeout: 16_000,
         });
         await newPage.select(frmAlta_sisCodigo, 'MAW');
+        this.logger.log('Seleccionado sistema: MAW');
 
         const frmAlta_codTipoDomicilio = '#frmAlta_codTipoDomicilio';
         await newPage.waitForSelector(frmAlta_codTipoDomicilio, {
           timeout: 16_000,
         });
         await newPage.select(frmAlta_codTipoDomicilio, '1-1');
+        this.logger.log('Seleccionado tipo de domicilio: 1-1');
 
         const xpath = `xpath/ .//span[@class="ui-button-text" and normalize-space(text())="Aceptar"]`;
 
         // 3) Obtén el primer nodo y haz click
         const [spanAceptar] = await newPage.$$(xpath);
         if (!spanAceptar) {
+          this.logger.error('No se encontró ningún <span> con texto "Aceptar"');
           throw new ConflictException(
             'No se encontró ningún <span> con texto "Aceptar"',
           );
         }
         await spanAceptar.click();
+        this.logger.log('Click en botón Aceptar realizado');
 
         await new Promise((resolve) => setTimeout(resolve, 5_000));
 
@@ -418,6 +411,13 @@ export class ScrapperService {
           visible: true,
         });
         await newPage.click(JqueryInfoDialog_btnYes);
+        this.logger.log('Click en confirmación realizado');
+
+        // Establecer el punto de venta DESPUÉS de completar todo el proceso exitosamente
+        this.currentSalePoint = nuevoPuntoVenta;
+        this.logger.log(
+          `Punto de venta creado exitosamente: ${this.currentSalePoint}`,
+        );
       } else {
         this.logger.verbose('Punto de venta ya existe');
         await newPage.waitForSelector('#tblmiGrilla_dataTable');
@@ -450,7 +450,9 @@ export class ScrapperService {
       }
     } catch (error) {
       this.logger.error('Error in createSellPoint:', error);
-      throw new ConflictException('Error in createSellPoint');
+      const errorMessage =
+        error instanceof Error ? error.message : 'Error desconocido';
+      throw new ConflictException(`Error in createSellPoint: ${errorMessage}`);
     }
   }
 
@@ -815,7 +817,10 @@ export class ScrapperService {
   private async getNewPage(browser: Browser): Promise<Page> {
     try {
       this.logger.log('Opening new page...');
-      const p = await this.waitForNewPage(browser, { timeoutMs: 12_000, mustHaveOpener: true });
+      const p = await this.waitForNewPage(browser, {
+        timeoutMs: 12_000,
+        mustHaveOpener: true,
+      });
       if (!p) throw new ConflictException('Timeout waiting for new page');
       await p.bringToFront().catch(() => {});
       await p.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
@@ -830,7 +835,11 @@ export class ScrapperService {
   /** Espera una nueva Page creada después de registrarse (sin carreras). */
   private waitForNewPage(
     browser: Browser,
-    opts: { timeoutMs?: number; mustHaveOpener?: boolean; urlPredicate?: (u: string) => boolean } = {}
+    opts: {
+      timeoutMs?: number;
+      mustHaveOpener?: boolean;
+      urlPredicate?: (u: string) => boolean;
+    } = {},
   ): Promise<Page | null> {
     const { timeoutMs = 12_000, mustHaveOpener = true, urlPredicate } = opts;
 
@@ -849,7 +858,10 @@ export class ScrapperService {
         }
       };
 
-      const timer = setTimeout(() => { cleanup(); resolve(null); }, timeoutMs);
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(null);
+      }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
         browser.off('targetcreated', onCreated);
@@ -863,33 +875,52 @@ export class ScrapperService {
   private async clickButtonByText(
     page: Page,
     containerSel: string,
-    targetText: string
+    targetText: string,
   ): Promise<boolean> {
     const normalize = (s: string) =>
       (s || '')
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        .replace(/\s+/g, ' ').trim().toLowerCase();
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
 
     const container = await page.$(containerSel);
     if (!container) return false;
 
-    const buttons = await page.$$(containerSel + ' button, ' + containerSel + ' .btn');
+    const buttons = await page.$$(
+      containerSel + ' button, ' + containerSel + ' .btn',
+    );
     const target = normalize(targetText);
 
     for (const btn of buttons) {
       const [txt, visible] = await Promise.all([
-        page.evaluate(el => (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase(), btn),
+        page.evaluate(
+          (el) =>
+            (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase(),
+          btn,
+        ),
         page.evaluate((el) => {
           const cs = getComputedStyle(el as HTMLElement);
           const r = (el as HTMLElement).getBoundingClientRect();
-          return cs.visibility !== 'hidden' && cs.display !== 'none' && r.width > 0 && r.height > 0;
+          return (
+            cs.visibility !== 'hidden' &&
+            cs.display !== 'none' &&
+            r.width > 0 &&
+            r.height > 0
+          );
         }, btn),
       ]);
-      if (!visible) { await btn.dispose(); continue; }
+      if (!visible) {
+        await btn.dispose();
+        continue;
+      }
       // tolerá "más" / "mas"
       if (normalize(txt) === target) {
-        await btn.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center' }));
-        await btn.click({ delay: 30 });  // gesto real
+        await btn.evaluate((el: HTMLElement) =>
+          el.scrollIntoView({ block: 'center' }),
+        );
+        await btn.click({ delay: 30 }); // gesto real
         await btn.dispose();
         return true;
       }
@@ -902,13 +933,13 @@ export class ScrapperService {
   private async handleModalIfPresent(
     page: Page,
     buttonText: string,
-    browser?: Browser,                 // si pasás browser, esperará popup
-    opts: { timeoutMs?: number } = {}
+    browser?: Browser, // si pasás browser, esperará popup
+    opts: { timeoutMs?: number } = {},
   ): Promise<Page | null> {
     const { timeoutMs = 12_000 } = opts;
 
     // pequeño margen para aparición/animación
-    await new Promise(res => setTimeout(res, 600));
+    await new Promise((res) => setTimeout(res, 600));
 
     const modal = await page.$('.modal-content');
     if (!modal) {
@@ -919,23 +950,35 @@ export class ScrapperService {
     this.logger.log(`Modal encontrada, buscando botón "${buttonText}"...`);
 
     let waitPopup: Promise<Page | null> | null = null;
-    if (browser) waitPopup = this.waitForNewPage(browser, { timeoutMs, mustHaveOpener: true });
+    if (browser)
+      waitPopup = this.waitForNewPage(browser, {
+        timeoutMs,
+        mustHaveOpener: true,
+      });
 
-    const clicked = await this.clickButtonByText(page, '.modal-content', buttonText);
+    const clicked = await this.clickButtonByText(
+      page,
+      '.modal-content',
+      buttonText,
+    );
     if (!clicked) {
       this.logger.log(`Botón "${buttonText}" no encontrado o no visible`);
       return null;
     }
 
     this.logger.log(`Botón "${buttonText}" clickeado`);
-    await new Promise(res => setTimeout(res, 500)); // cierre de modal/animación
+    await new Promise((res) => setTimeout(res, 500)); // cierre de modal/animación
 
     let popup: Page | null = null;
     if (waitPopup) {
       popup = await waitPopup;
       if (popup) {
-        try { await popup.bringToFront(); } catch {}
-        try { await popup.waitForSelector('body', { timeout: 10_000 }); } catch {}
+        try {
+          await popup.bringToFront();
+        } catch {}
+        try {
+          await popup.waitForSelector('body', { timeout: 10_000 });
+        } catch {}
       }
     }
     return popup;
@@ -944,10 +987,12 @@ export class ScrapperService {
   /** Flujo completo. Devuelve la nueva Page si se abre en popup; null si navega in-tab. */
   private async goToCertificadosDigitales(page: Page): Promise<void> {
     try {
-      this.logger.log('Navigating to Administración de Certificados Digitales...');
+      this.logger.log(
+        'Navigating to Administración de Certificados Digitales...',
+      );
 
       await page.waitForFunction(() => document.readyState === 'complete');
-      await new Promise(res => setTimeout(res, 500));
+      await new Promise((res) => setTimeout(res, 500));
 
       // Modal "Recordar más tarde" (no abre popup → no pasamos browser aquí)
       await this.handleModalIfPresent(page, 'recordar mas tarde');
@@ -955,30 +1000,48 @@ export class ScrapperService {
       // Buscador
       await page.waitForSelector('#buscadorInput', { timeout: 30_000 });
       await page.click('#buscadorInput', { delay: 20 });
-      const isMac = await page.evaluate(() => navigator.platform.includes('Mac'));
+      const isMac = await page.evaluate(() =>
+        navigator.platform.includes('Mac'),
+      );
       await page.keyboard.down(isMac ? 'Meta' : 'Control');
       await page.keyboard.press('KeyA');
       await page.keyboard.up(isMac ? 'Meta' : 'Control');
-      await page.type('#buscadorInput', 'Administración de Certificados Digitales', { delay: 50 });
+      await page.type(
+        '#buscadorInput',
+        'Administración de Certificados Digitales',
+        { delay: 50 },
+      );
 
       await page.waitForSelector('#rbt-menu-item-0', { timeout: 15_000 });
 
       // 1) Intento 1: el click del resultado abre popup
-      let waitPopup = this.waitForNewPage(this.browser, { timeoutMs: 12_000, mustHaveOpener: true });
+      const waitPopup = this.waitForNewPage(this.browser, {
+        timeoutMs: 12_000,
+        mustHaveOpener: true,
+      });
       await page.click('#rbt-menu-item-0', { delay: 30 });
 
       let newPage = await waitPopup;
 
       // 2) Si no hubo popup, puede aparecer una modal de confirmación que SÍ lo abre
       if (!newPage) {
-        this.logger.log('No hubo popup tras seleccionar el resultado; verifico modal "Continuar"...');
-        newPage = await this.handleModalIfPresent(page, 'continuar', this.browser, { timeoutMs: 12_000 });
+        this.logger.log(
+          'No hubo popup tras seleccionar el resultado; verifico modal "Continuar"...',
+        );
+        newPage = await this.handleModalIfPresent(
+          page,
+          'continuar',
+          this.browser,
+          { timeoutMs: 12_000 },
+        );
 
         // 3) Si tampoco hubo popup, esperá navegación en la misma pestaña (fallback)
         if (!newPage) {
           await Promise.race([
-            page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 8_000 }).catch(() => null),
-            new Promise(res => setTimeout(res, 1200)),
+            page
+              .waitForNavigation({ waitUntil: 'networkidle0', timeout: 8_000 })
+              .catch(() => null),
+            new Promise((res) => setTimeout(res, 1200)),
           ]);
         }
       }
@@ -988,9 +1051,10 @@ export class ScrapperService {
         // Guardar la nueva página para uso posterior
         this.currentCertificatePage = newPage;
       } else {
-        this.logger.log('Navegación a Certificados Digitales completada (misma pestaña)');
+        this.logger.log(
+          'Navegación a Certificados Digitales completada (misma pestaña)',
+        );
       }
-
     } catch (error) {
       this.logger.error('Error navigating to Portal IVA:', error);
       throw new ConflictException('Error navigating to Portal IVA');
