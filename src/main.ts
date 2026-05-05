@@ -1,4 +1,5 @@
 import { NestFactory } from '@nestjs/core';
+import compression from 'compression';
 import { AppModule } from './app.module';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
@@ -6,6 +7,10 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log', 'debug', 'verbose'],
   });
+
+  // gzip — reduce egress de respuestas JSON 70-85%. Va antes del prefix
+  // para que también comprima el handshake de Swagger.
+  app.use(compression());
 
   const globalPrefix = 'api';
   app.setGlobalPrefix(globalPrefix);
