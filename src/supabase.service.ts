@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
+import WebSocket from 'ws';
 import { config } from 'src/config/config';
 import { Database } from './types/supabase.types';
 
@@ -12,7 +13,12 @@ export class SupabaseService {
     const supabaseUrl = config.supabaseUrl ?? '';
     const supabaseKey = config.supabaseApiKey ?? '';
 
-    this.supabase = createClient<Database>(supabaseUrl, supabaseKey);
+    // Node < 22 (la imagen base es Node 18) no trae WebSocket global, así
+    // que realtime-js explota al inicializarse. Le pasamos `ws` como
+    // transport explícito para destrabarlo.
+    this.supabase = createClient<Database>(supabaseUrl, supabaseKey, {
+      realtime: { transport: WebSocket as never },
+    });
   }
 
   async getFacturacionUser(
