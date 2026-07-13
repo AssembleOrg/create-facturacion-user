@@ -72,6 +72,140 @@ export class ScrapperService {
     }
   }
 
+  /**
+   * Autoriza el servicio WSCCOMU (Consumir Comunicaciones de Ventanilla
+   * Electrónica) al computador fiscal EXISTENTE del contribuyente. No crea
+   * certificado nuevo ni punto de venta: solo agrega la relación en
+   * Administrador de Relaciones. Un job por usuario.
+   */
+  async authorizeVentanilla(username: string): Promise<{ jobId: number }> {
+    const job = await this.jobRepository.save({
+      username: `wsccomu:${username}`,
+      status: 'pending',
+    });
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    this.runVentanillaJob(job.id, username);
+    return { jobId: job.id };
+  }
+
+  /**
+   * Corre la autorización WSCCOMU para todos los usuarios de facturación (o
+   * la lista recibida) en serie — un browser por vez. Devuelve el mapa
+   * username → jobId para seguir cada uno con GET /scrapper/status/:id.
+   */
+  async authorizeVentanillaBatch(
+    usernames?: string[],
+  ): Promise<Array<{ username: string; jobId: number }>> {
+    let targets = usernames;
+    if (!targets || targets.length === 0) {
+      const users = await this.supabaseService.getFacturacionUsers();
+      targets = users
+        .map((u) => u.username)
+        .filter((u): u is string => !!u);
+    }
+
+    const jobs: Array<{ username: string; jobId: number }> = [];
+    for (const username of targets) {
+      const job = await this.jobRepository.save({
+        username: `wsccomu:${username}`,
+        status: 'pending',
+      });
+      jobs.push({ username, jobId: job.id });
+    }
+
+    // Secuencial en background: puppeteer no tolera sesiones en paralelo acá.
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    (async () => {
+      for (const j of jobs) {
+        await this.runVentanillaJob(j.jobId, j.username);
+      }
+      this.logger.log(`✔️ Batch WSCCOMU terminado: ${jobs.length} usuarios`);
+    })();
+
+    return jobs;
+  }
+
+  private async runVentanillaJob(jobId: number, username: string) {
+    try {
+      await this.runVentanillaLogic(username);
+      await this.jobRepository.update(jobId, { status: 'success' });
+      this.logger.log(`✔️ Job WSCCOMU #${jobId} (${username}) completado`);
+    } catch (error) {
+      this.logger.error(
+        `❌ Job WSCCOMU #${jobId} (${username}) falló: ${error.message}`,
+      );
+      await this.jobRepository.update(jobId, {
+        status: 'error',
+        error: error.message,
+      });
+    }
+  }
+
+  private async runVentanillaLogic(username: string): Promise<void> {
+    try {
+      const user = await this.supabaseService.getFacturacionUser(username);
+      if (!user.password) {
+        throw new BadRequestException(
+          `Usuario ${username} sin clave fiscal guardada`,
+        );
+      }
+
+      this.browser = await puppeteer.launch({
+        headless: false,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--single-process',
+          '--no-zygote',
+        ],
+      });
+
+      this.originalPage = await this.browser.newPage();
+      await this.originalPage.goto(this.url);
+      await this.originalPage.waitForSelector(
+        'a.btn.btn-sm.btn-info.btn-block.uppercase',
+      );
+      await this.originalPage.click(
+        'a.btn.btn-sm.btn-info.btn-block.uppercase',
+      );
+
+      const newPage: Page = await this.getNewPage(this.browser);
+      await this.loginToAfip(newPage, user.username!, user.password);
+      if (!this.loggedIn) {
+        throw new InternalServerErrorException(
+          'No se pudo iniciar sesión en AFIP',
+        );
+      }
+
+      await this.findService(
+        'Administrador de Relaciones de Clave Fiscal',
+        newPage,
+      );
+
+      // Mismo circuito que Facturación Electrónica pero eligiendo el
+      // servicio de Ventanilla; usa el computador fiscal ya existente.
+      await this.addServiceRelacion(user.username!, 'Ventanilla');
+
+      await this.close();
+    } catch (error) {
+      await this.close();
+      // "ya existe la relación" no es un error real: dejarlo explícito
+      if (
+        typeof error?.message === 'string' &&
+        error.message.toLowerCase().includes('existe')
+      ) {
+        this.logger.warn(
+          `WSCCOMU ya estaba autorizado para ${username}: ${error.message}`,
+        );
+        return;
+      }
+      throw error instanceof BadRequestException ||
+        error instanceof ConflictException
+        ? error
+        : new BadRequestException(error.message);
+    }
+  }
+
   public async getJob(id: number): Promise<JobEntity> {
     const job = await this.jobRepository.findOne({
       where: { id },
@@ -211,7 +345,7 @@ export class ScrapperService {
     realName: string,
   ): Promise<void> {
     this.browser = await puppeteer.launch({
-      headless: true,
+      headless: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -456,7 +590,10 @@ export class ScrapperService {
     }
   }
 
-  private async addServiceRelacion(cuit: string): Promise<void> {
+  private async addServiceRelacion(
+    cuit: string,
+    serviceLinkText: string = 'Facturación Electrónica',
+  ): Promise<void> {
     try {
       const newPage: Page = await this.getNewPage(this.browser);
       // await new Promise((resolve) => setTimeout(resolve, 300_000));
@@ -569,20 +706,18 @@ export class ScrapperService {
 
       await newPage.click('#ctrl\\.org\\.afip\\.grp\\.webservices');
 
-      await newPage.evaluate(() => {
+      await newPage.evaluate((linkText: string) => {
         const links = Array.from(document.querySelectorAll('td a'));
         const feLink = links.find((el) =>
-          el.textContent?.includes('Facturación Electrónica'),
+          el.textContent?.includes(linkText),
         ) as HTMLElement | null;
 
         if (!feLink) {
-          throw new Error(
-            '❌ No se encontró el link "Facturación Electrónica"',
-          );
+          throw new Error(`❌ No se encontró el link "${linkText}"`);
         }
         feLink.scrollIntoView({ behavior: 'auto', block: 'center' });
         feLink.click();
-      });
+      }, serviceLinkText);
       const cmdBuscarUsuario = '#cmdBuscarUsuario';
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       await newPage.waitForSelector(cmdBuscarUsuario, {

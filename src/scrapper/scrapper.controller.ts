@@ -74,6 +74,55 @@ export class ScrapperController {
     return await this.scrapperService.createCertificateAndPersistUser(username);
   }
 
+  @Post('ventanilla')
+  @ApiOperation({
+    summary:
+      'Autorizar WSCCOMU (e-Ventanilla) al certificado existente de un usuario',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string', description: 'CUIT del usuario' },
+      },
+      required: ['username'],
+    },
+  })
+  @ApiBadRequestResponse({ description: 'Faltan parámetros o son inválidos' })
+  async ventanilla(@Body('username') username: string) {
+    this.logger.log(`ScrapperController.ventanilla() → username=${username}`);
+    if (!username) {
+      throw new BadRequestException('“username” es obligatorio');
+    }
+    return await this.scrapperService.authorizeVentanilla(username);
+  }
+
+  @Post('ventanilla/batch')
+  @ApiOperation({
+    summary:
+      'Autorizar WSCCOMU para todos los usuarios de facturación (o la lista indicada), en serie',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        usernames: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'CUITs a procesar. Vacío/ausente = todos los facturacion_users.',
+        },
+      },
+    },
+    required: false,
+  })
+  async ventanillaBatch(@Body('usernames') usernames?: string[]) {
+    this.logger.log(
+      `ScrapperController.ventanillaBatch() → ${usernames?.length ?? 'todos'}`,
+    );
+    return await this.scrapperService.authorizeVentanillaBatch(usernames);
+  }
+
   @Get('status/:id')
   @ApiOperation({ summary: 'Obtener el estado de un job' })
   @ApiParam({
