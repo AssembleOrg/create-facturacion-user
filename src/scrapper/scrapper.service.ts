@@ -869,7 +869,12 @@ export class ScrapperService {
         timeout: 10_000,
       });
       await newPage.click(cmdBuscarServicio);
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      // Vía proxy el árbol de servicios puede tardar más que un sleep fijo.
+      await newPage.waitForSelector(
+        'img[alt="Agencia de Recaudación y Control Aduanero"]',
+        { timeout: 60_000 },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
 
       await newPage.evaluate(() => {
         const img = document.querySelector(
