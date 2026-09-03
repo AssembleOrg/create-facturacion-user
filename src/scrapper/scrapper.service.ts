@@ -342,8 +342,31 @@ export class ScrapperService {
       throw new BadRequestException('No se encontró usuario');
     } catch (error) {
       this.logger.error('Error in initialize:', error);
+      await this.screenshotAllPages(usuario ?? 'unknown');
       await this.close();
       throw new BadRequestException(error.message);
+    }
+  }
+
+  /** Captura todas las pestañas abiertas en static/errors/<cuit>-<n>.png para diagnóstico. */
+  private async screenshotAllPages(tag: string): Promise<void> {
+    try {
+      if (!this.browser) return;
+      const dir = join(process.cwd(), 'static', 'errors');
+      mkdirSync(dir, { recursive: true });
+      const pages = await this.browser.pages();
+      for (let i = 0; i < pages.length; i++) {
+        const p = pages[i];
+        const file = join(dir, `${tag}-${Date.now()}-${i}.png`);
+        try {
+          await p.screenshot({ path: file as `${string}.png`, fullPage: true });
+          this.logger.warn(`Screenshot ${file} (${p.url()})`);
+        } catch (e) {
+          this.logger.warn(`No se pudo capturar pestaña ${i}: ${e?.message}`);
+        }
+      }
+    } catch (e) {
+      this.logger.warn(`screenshotAllPages falló: ${e?.message}`);
     }
   }
 
@@ -529,17 +552,36 @@ export class ScrapperService {
         await newPage.waitForSelector(tblmiGrilla_totalRecords, {
           timeout: 16_000,
         });
-        const totalRecords = await newPage.evaluate(
+        // Próximo número = max(puntos de venta existentes en la grilla) + 1.
+        // Fallback: totalRecords (texto puede venir vacío/no numérico → 0).
+        const { maxPv, totalRecords } = await newPage.evaluate(
           (tblmiGrilla_totalRecords) => {
-            const totalRecords = document.querySelector(
-              tblmiGrilla_totalRecords,
-            )?.textContent;
-            return totalRecords ? parseInt(totalRecords) : 0;
+            const nums: number[] = [];
+            document
+              .querySelectorAll('#tblmiGrilla_dataTable tr')
+              .forEach((row) => {
+                const td = row.querySelector('td');
+                const n = parseInt(
+                  (td?.textContent || '').replace(/ /g, '').trim(),
+                  10,
+                );
+                if (!isNaN(n)) nums.push(n);
+              });
+            const txt =
+              document.querySelector(tblmiGrilla_totalRecords)?.textContent ||
+              '';
+            const m = txt.match(/\d+/);
+            return {
+              maxPv: nums.length ? Math.max(...nums) : 0,
+              totalRecords: m ? parseInt(m[0], 10) : 0,
+            };
           },
           tblmiGrilla_totalRecords,
         );
 
-        this.logger.log(`Total de registros encontrados: ${totalRecords}`);
+        this.logger.log(
+          `Puntos de venta existentes: max=${maxPv}, totalRecords=${totalRecords}`,
+        );
 
         const [btn] = await newPage.$$(
           `xpath/ .//span[@class="ui-button-text" and normalize-space(text())="Agregar.."]`,
@@ -559,7 +601,12 @@ export class ScrapperService {
         await newPage.waitForSelector(frmAlta_pveNro, {
           timeout: 16_000,
         });
-        const nuevoPuntoVenta = totalRecords + 1;
+        const nuevoPuntoVenta = Math.max(maxPv, totalRecords) + 1;
+        if (!Number.isInteger(nuevoPuntoVenta) || nuevoPuntoVenta < 1) {
+          throw new ConflictException(
+            `Número de punto de venta inválido: ${nuevoPuntoVenta}`,
+          );
+        }
         await newPage.type(frmAlta_pveNro, nuevoPuntoVenta.toString());
         this.logger.log(
           `Tipeando número de punto de venta: ${nuevoPuntoVenta}`,
@@ -950,7 +997,8 @@ export class ScrapperService {
         downloadPath: downloadDir,
       });
 
-      await page.waitForSelector('table', { visible: true });
+      // La grilla de certificados a veces tarda >30s en volver tras el alta.
+      await page.waitForSelector('table', { visible: true, timeout: 90_000 });
 
       const matchingTrHandle = await page.evaluateHandle((alias) => {
         const tables = Array.from(
