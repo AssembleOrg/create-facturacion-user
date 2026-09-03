@@ -44,17 +44,87 @@ export class ScrapperService {
   /**
    * HEADLESS=false abre Chrome visible (corridas locales con intervención
    * humana, ver run-batch.ts). Default headless para docker.
+   *
+   * PROXY_POOL (mismo formato que profitos-next: `user:pass@host:port`
+   * separados por coma) → se elige una entrada al azar por browser (rotación
+   * residencial). BROWSER_EXECUTABLE → binario real (ej. Brave) en lugar del
+   * Chromium bundle de puppeteer.
    */
+  private currentProxy?: { server: string; username?: string; password?: string };
+
+  private pickProxy() {
+    const raw = process.env.PROXY_POOL?.trim();
+    if (!raw) return undefined;
+    const entries = raw
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => {
+        try {
+          const u = new URL(/^\w+:\/\//.test(s) ? s : `http://${s}`);
+          return {
+            server: `${u.protocol}//${u.host}`,
+            username: u.username ? decodeURIComponent(u.username) : undefined,
+            password: u.password ? decodeURIComponent(u.password) : undefined,
+          };
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((x): x is NonNullable<typeof x> => Boolean(x));
+    if (!entries.length) return undefined;
+    return entries[Math.floor(Math.random() * entries.length)];
+  }
+
   private launchOptions() {
     const headless = process.env.HEADLESS !== 'false';
+    this.currentProxy = this.pickProxy();
+    const executablePath = process.env.BROWSER_EXECUTABLE?.trim() || undefined;
+    if (this.currentProxy) {
+      this.logger.log(`Proxy: ${this.currentProxy.server}`);
+    }
+    if (executablePath) this.logger.log(`Browser: ${executablePath}`);
     return {
       headless,
+      executablePath,
+      ignoreDefaultArgs: ['--enable-automation'],
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--lang=es-AR',
+        '--no-first-run',
+        '--no-default-browser-check',
+        ...(this.currentProxy
+          ? [`--proxy-server=${this.currentProxy.server}`]
+          : []),
         ...(headless ? ['--single-process', '--no-zygote'] : []),
       ],
     };
+  }
+
+  /**
+   * Lanza el browser y, si hay proxy con credenciales, autentica cada pestaña
+   * (las que abre AFIP por popup incluidas) vía page.authenticate.
+   */
+  private async launchBrowser(): Promise<Browser> {
+    const browser = await puppeteer.launch(this.launchOptions());
+    const proxy = this.currentProxy;
+    if (proxy?.username) {
+      const creds = { username: proxy.username, password: proxy.password ?? '' };
+      const auth = async (p: Page | null) => {
+        if (!p) return;
+        await p.authenticate(creds).catch((e) =>
+          this.logger.warn(`page.authenticate falló: ${e?.message}`),
+        );
+      };
+      for (const p of await browser.pages()) await auth(p);
+      browser.on('targetcreated', async (t) => {
+        if (t.type() !== 'page') return;
+        await auth(await t.page().catch(() => null));
+      });
+    }
+    return browser;
   }
 
   async createCertificateAndPersistUser(
@@ -166,7 +236,7 @@ export class ScrapperService {
         );
       }
 
-      this.browser = await puppeteer.launch(this.launchOptions());
+      this.browser = await this.launchBrowser();
 
       this.originalPage = await this.browser.newPage();
       await this.originalPage.goto(this.url);
@@ -375,7 +445,7 @@ export class ScrapperService {
     password: string,
     realName: string,
   ): Promise<void> {
-    this.browser = await puppeteer.launch(this.launchOptions());
+    this.browser = await this.launchBrowser();
 
     this.originalPage = await this.browser.newPage();
 
