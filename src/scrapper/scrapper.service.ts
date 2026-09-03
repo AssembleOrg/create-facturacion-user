@@ -127,6 +127,36 @@ export class ScrapperService {
     return browser;
   }
 
+  /**
+   * Lanza el browser, abre la landing de AFIP y clickea "Acceso con clave
+   * fiscal" (abre el popup de login). Si la landing no carga (IP del pool
+   * lenta/caída), cierra y relanza con otra IP, hasta 2 intentos.
+   */
+  private async openLandingAndClickAcceso(): Promise<void> {
+    const ACCESO = 'a.btn.btn-sm.btn-info.btn-block.uppercase';
+    const MAX = 2;
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      this.browser = await this.launchBrowser();
+      this.originalPage = await this.browser.newPage();
+      try {
+        await this.originalPage.goto(this.url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60_000,
+        });
+        await this.originalPage.waitForSelector(ACCESO, { timeout: 30_000 });
+        await this.originalPage.click(ACCESO);
+        return;
+      } catch (e) {
+        this.logger.warn(
+          `Landing AFIP no cargó (intento ${attempt}/${MAX}, proxy ${this.currentProxy?.server ?? 'directo'}): ${e?.message}`,
+        );
+        await this.close();
+        if (attempt === MAX) throw e;
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+    }
+  }
+
   async createCertificateAndPersistUser(
     username: string,
   ): Promise<{ jobId: number }> {
@@ -236,16 +266,7 @@ export class ScrapperService {
         );
       }
 
-      this.browser = await this.launchBrowser();
-
-      this.originalPage = await this.browser.newPage();
-      await this.originalPage.goto(this.url);
-      await this.originalPage.waitForSelector(
-        'a.btn.btn-sm.btn-info.btn-block.uppercase',
-      );
-      await this.originalPage.click(
-        'a.btn.btn-sm.btn-info.btn-block.uppercase',
-      );
+      await this.openLandingAndClickAcceso();
 
       const newPage: Page = await this.getNewPage(this.browser);
       await this.loginToAfip(newPage, user.username!, user.password);
@@ -445,15 +466,7 @@ export class ScrapperService {
     password: string,
     realName: string,
   ): Promise<void> {
-    this.browser = await this.launchBrowser();
-
-    this.originalPage = await this.browser.newPage();
-
-    await this.originalPage.goto(this.url);
-    await this.originalPage.waitForSelector(
-      'a.btn.btn-sm.btn-info.btn-block.uppercase',
-    );
-    await this.originalPage.click('a.btn.btn-sm.btn-info.btn-block.uppercase');
+    await this.openLandingAndClickAcceso();
 
     const newPage: Page = await this.getNewPage(this.browser);
 
