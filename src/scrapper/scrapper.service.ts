@@ -1066,24 +1066,28 @@ export class ScrapperService {
           timeout: 20_000,
           visible: true,
         });
+        // Esperar la respuesta real del POST (vía proxy puede superar 15s),
+        // no un sleep fijo: si no, el chequeo ve el form viejo sin error.
+        const nav = page
+          .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 90_000 })
+          .catch(() => null);
         await page.click('#cmdIngresar');
+        await nav;
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
 
-        await new Promise((resolve) => setTimeout(resolve, 15_000));
-
-        // El mensaje puede estar en un iframe: se revisan todos los frames.
-        const afipError = (
-          await Promise.all(
-            page.frames().map((f) =>
-              f
-                .evaluate(() =>
-                  /Internal Server Error|Request enviado es inv/i.test(
-                    document.body?.innerText || '',
-                  ),
-                )
-                .catch(() => false),
-            ),
-          )
-        ).some(Boolean);
+        // El mensaje puede estar en un iframe: se revisa el HTML de todos los
+        // frames de todas las pestañas (la de certificados puede no ser `page`).
+        const ERR_RE = /Internal Server Error|Request enviado es inv/i;
+        const frames = (await this.browser.pages()).flatMap((p) => p.frames());
+        const hits: string[] = [];
+        for (const f of frames) {
+          const html = await f.content().catch(() => '');
+          if (ERR_RE.test(html)) hits.push(f.url());
+        }
+        this.logger.log(
+          `Chequeo post-subida CSR: ${frames.length} frames, error ARCA en ${hits.length ? hits.join(', ') : 'ninguno'}`,
+        );
+        const afipError = hits.length > 0;
         if (!afipError) break;
         if (attempt === MAX_UPLOAD_ATTEMPTS) {
           throw new ConflictException(
