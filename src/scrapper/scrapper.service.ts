@@ -1109,10 +1109,21 @@ export class ScrapperService {
         // El mensaje puede estar en un iframe: se revisa el HTML de todos los
         // frames de todas las pestañas (la de certificados puede no ser `page`).
         const ERR_RE = /Internal Server Error|Request enviado es inv/i;
-        const frames = (await this.browser.pages()).flatMap((p) => p.frames());
+        let frames: ReturnType<Page['frames']> = [];
+        try {
+          frames = (await this.browser.pages()).flatMap((p) => p.frames());
+        } catch {
+          frames = page.frames();
+        }
         const hits: string[] = [];
         for (const f of frames) {
-          const html = await f.content().catch(() => '');
+          // Un frame puede desprenderse en medio de la navegación: se ignora.
+          let html = '';
+          try {
+            html = await f.content();
+          } catch {
+            continue;
+          }
           if (ERR_RE.test(html)) hits.push(f.url());
         }
         this.logger.log(
