@@ -41,6 +41,22 @@ export class ScrapperService {
     // Constructor remains synchronous. Initialization is handled separately.
   }
 
+  /**
+   * HEADLESS=false abre Chrome visible (corridas locales con intervención
+   * humana, ver run-batch.ts). Default headless para docker.
+   */
+  private launchOptions() {
+    const headless = process.env.HEADLESS !== 'false';
+    return {
+      headless,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        ...(headless ? ['--single-process', '--no-zygote'] : []),
+      ],
+    };
+  }
+
   async createCertificateAndPersistUser(
     username: string,
   ): Promise<{ jobId: number }> {
@@ -150,15 +166,7 @@ export class ScrapperService {
         );
       }
 
-      this.browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--single-process',
-          '--no-zygote',
-        ],
-      });
+      this.browser = await puppeteer.launch(this.launchOptions());
 
       this.originalPage = await this.browser.newPage();
       await this.originalPage.goto(this.url);
@@ -344,15 +352,7 @@ export class ScrapperService {
     password: string,
     realName: string,
   ): Promise<void> {
-    this.browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--single-process',
-        '--no-zygote',
-      ],
-    });
+    this.browser = await puppeteer.launch(this.launchOptions());
 
     this.originalPage = await this.browser.newPage();
 
@@ -388,26 +388,81 @@ export class ScrapperService {
 
     await newPage.bringToFront();
 
+    const popupRelaciones = this.waitForNewPage(this.browser, {
+      timeoutMs: 30_000,
+      mustHaveOpener: true,
+    });
     await this.findService(
       'Administrador de Relaciones de Clave Fiscal',
       newPage,
     );
 
-    await this.addServiceRelacion(usuario);
+    await this.addServiceRelacion(usuario, 'Facturación Electrónica', {
+      portalPage: newPage,
+      popupPromise: popupRelaciones,
+    });
 
     await newPage.bringToFront();
+    // La espera del popup se arma ANTES del click del buscador para no
+    // perder la pestaña si abre rápido.
+    const popupPuntosVenta = this.waitForNewPage(this.browser, {
+      timeoutMs: 30_000,
+      mustHaveOpener: true,
+    });
     await this.findService(
       'Administración de Puntos de Venta y Domicilios',
       newPage,
     );
 
-    await this.createSellPoint(realName);
+    await this.createSellPoint(realName, newPage, popupPuntosVenta);
     await this.close();
   }
 
-  private async createSellPoint(nameOnDb: string): Promise<void> {
+  /**
+   * Resuelve la Page del servicio abierto desde el portal: popup ya esperado,
+   * o modal "Continuar" que abre popup, o navegación en la misma pestaña.
+   */
+  private async resolveServicePage(
+    portalPage: Page,
+    popupPromise: Promise<Page | null>,
+    readySelector: string,
+  ): Promise<Page> {
+    let p = await popupPromise;
+    if (!p) {
+      this.logger.warn('Sin popup; verifico modal "Continuar"...');
+      p = await this.handleModalIfPresent(portalPage, 'continuar', this.browser, {
+        timeoutMs: 15_000,
+      });
+    }
+    if (!p) {
+      this.logger.warn('Sin popup ni modal; pruebo misma pestaña...');
+      const ok = await portalPage
+        .waitForSelector(readySelector, { timeout: 15_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!ok) {
+        throw new ConflictException(
+          `No se abrió el servicio (ni popup, ni modal, ni misma pestaña). Esperaba ${readySelector}`,
+        );
+      }
+      p = portalPage;
+    }
+    await p.bringToFront().catch(() => {});
+    await p.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
+    return p;
+  }
+
+  private async createSellPoint(
+    nameOnDb: string,
+    portalPage: Page,
+    popupPromise: Promise<Page | null>,
+  ): Promise<void> {
     try {
-      const newPage: Page = await this.getNewPage(this.browser);
+      const newPage: Page = await this.resolveServicePage(
+        portalPage,
+        popupPromise,
+        'td[align="center"] input[type="button"]',
+      );
 
       // 1) Divide el nombre en tokens y normaliza a minúsculas
       const tokens = nameOnDb.split(/\s+/).map((t) => t.toUpperCase());
@@ -593,9 +648,16 @@ export class ScrapperService {
   private async addServiceRelacion(
     cuit: string,
     serviceLinkText: string = 'Facturación Electrónica',
+    opened?: { portalPage: Page; popupPromise: Promise<Page | null> },
   ): Promise<void> {
     try {
-      const newPage: Page = await this.getNewPage(this.browser);
+      const newPage: Page = opened
+        ? await this.resolveServicePage(
+            opened.portalPage,
+            opened.popupPromise,
+            '#cmdNuevaRelacion, #tblAutoridadAplicacion_cmbCont',
+          )
+        : await this.getNewPage(this.browser);
       // await new Promise((resolve) => setTimeout(resolve, 300_000));
       const multipleDropdown = '#tblAutoridadAplicacion_cmbCont';
       try {
@@ -1218,21 +1280,41 @@ export class ScrapperService {
       this.logger.log('Clicking login button...');
       // await new Promise((resolve) => setTimeout(resolve, 2000_000));
       const idCaptcha = '#captcha img';
+      let captcha: ElementHandle | null = null;
       try {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
-        await page.waitForSelector(idCaptcha, { timeout: 10_000 });
-
-        throw new ConflictException('Captcha activado');
+        captcha = await page.waitForSelector(idCaptcha, { timeout: 10_000 });
       } catch (e) {
-        if (e instanceof ConflictException) {
-          this.logger.error(e.message);
-          throw new ConflictException('Captcha activation');
-        }
         if (e instanceof TimeoutError) {
           this.logger.warn('No se encontró el captcha (timeout)');
         } else {
           this.logger.warn('Error esperando el captcha', e);
         }
+      }
+      if (captcha) {
+        // Captcha: en modo headful se espera a que un humano lo resuelva y
+        // clickee Ingresar. Se detecta el login por la desaparición del form.
+        const waitMs = Number(process.env.HUMAN_WAIT_MS || 180_000);
+        this.logger.warn(
+          `⚠️  CAPTCHA detectado para ${username}. Esperando intervención humana hasta ${Math.round(waitMs / 1000)}s: resolvé el captcha y clickeá Ingresar.`,
+        );
+        const deadline = Date.now() + waitMs;
+        let solved = false;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          const stillLogin = await page.$('#F1\\:password').catch(() => null);
+          if (!stillLogin) {
+            solved = true;
+            break;
+          }
+        }
+        if (!solved) {
+          this.logger.error('Captcha no resuelto a tiempo');
+          throw new ConflictException('Captcha activation');
+        }
+        this.logger.log('Captcha resuelto por humano, continuando');
+        this.loggedIn = true;
+        return;
       }
       await page.click('#F1\\:btnIngresar');
       this.loggedIn = true;
