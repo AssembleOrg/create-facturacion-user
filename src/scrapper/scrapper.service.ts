@@ -1431,10 +1431,16 @@ export class ScrapperService {
   ): Promise<void> {
     try {
       this.logger.log(`Logging in to AFIP...${username}`);
-      await page.waitForFunction(() => document.readyState === 'complete');
+      // readyState 'complete' puede no llegar nunca vía proxy (algún recurso
+      // colgado); no es requisito para el form: se espera acotado y se sigue.
+      await page
+        .waitForFunction(() => document.readyState === 'complete', {
+          timeout: 20_000,
+        })
+        .catch(() => this.logger.warn('readyState no llegó a complete; sigo'));
       this.logger.log('Waiting for username...');
       await page.waitForSelector('#F1\\:username', {
-        timeout: 16_000,
+        timeout: 45_000,
       });
       await page.type('#F1\\:username', username);
       await page.click('#F1\\:btnSiguiente');
