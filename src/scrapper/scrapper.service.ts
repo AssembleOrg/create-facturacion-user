@@ -1057,13 +1057,20 @@ export class ScrapperService {
 
         await new Promise((resolve) => setTimeout(resolve, 15_000));
 
-        const afipError = await page
-          .evaluate(() =>
-            /Internal Server Error|Request enviado es inv/i.test(
-              document.body?.innerText || '',
+        // El mensaje puede estar en un iframe: se revisan todos los frames.
+        const afipError = (
+          await Promise.all(
+            page.frames().map((f) =>
+              f
+                .evaluate(() =>
+                  /Internal Server Error|Request enviado es inv/i.test(
+                    document.body?.innerText || '',
+                  ),
+                )
+                .catch(() => false),
             ),
           )
-          .catch(() => false);
+        ).some(Boolean);
         if (!afipError) break;
         if (attempt === MAX_UPLOAD_ATTEMPTS) {
           throw new ConflictException(
