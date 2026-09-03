@@ -866,7 +866,7 @@ export class ScrapperService {
 
       const cmdBuscarServicio = '#cmdBuscarServicio';
       await newPage.waitForSelector(cmdBuscarServicio, {
-        timeout: 10_000,
+        timeout: 30_000,
       });
       await newPage.click(cmdBuscarServicio);
       // Vía proxy el árbol de servicios puede tardar más que un sleep fijo.
@@ -924,7 +924,7 @@ export class ScrapperService {
 
       await newPage.waitForSelector('#ctrl\\.org\\.afip\\.grp\\.webservices', {
         visible: true,
-        timeout: 5000,
+        timeout: 30_000,
       });
 
       await newPage.click('#ctrl\\.org\\.afip\\.grp\\.webservices');
@@ -944,7 +944,7 @@ export class ScrapperService {
       const cmdBuscarUsuario = '#cmdBuscarUsuario';
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       await newPage.waitForSelector(cmdBuscarUsuario, {
-        timeout: 10_000,
+        timeout: 30_000,
         visible: true,
       });
       await newPage.click(cmdBuscarUsuario);
@@ -966,14 +966,14 @@ export class ScrapperService {
 
       const cmdSeleccionarServicio = '#cmdSeleccionarServicio';
       await newPage.waitForSelector(cmdSeleccionarServicio, {
-        timeout: 10_000,
+        timeout: 30_000,
         visible: true,
       });
       await newPage.click(cmdSeleccionarServicio);
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       const cmdGenerarRelacion = '#cmdGenerarRelacion';
       await newPage.waitForSelector(cmdGenerarRelacion, {
-        timeout: 10_000,
+        timeout: 30_000,
         visible: true,
       });
       await newPage.click(cmdGenerarRelacion);
