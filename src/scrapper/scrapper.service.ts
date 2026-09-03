@@ -965,26 +965,50 @@ export class ScrapperService {
         'csr-creado.pem', // reemplaza con tu nombre real
       );
 
-      const fileInputHandle = (await page.$(
-        idInput,
-      )) as ElementHandle<HTMLInputElement>;
-      if (!fileInputHandle) {
-        throw new ConflictException(
-          `No se encontró el input con selector ${idInput}`,
+      // ARCA a veces responde "El Request enviado es inválido / Internal
+      // Server Error" al subir el CSR (falla transitoria de su backend). El
+      // form queda en pantalla con el alias cargado: se reintenta la subida.
+      const MAX_UPLOAD_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+        const fileInputHandle = (await page.$(
+          idInput,
+        )) as ElementHandle<HTMLInputElement>;
+        if (!fileInputHandle) {
+          throw new ConflictException(
+            `No se encontró el input con selector ${idInput}`,
+          );
+        }
+        await fileInputHandle.uploadFile(filePath);
+        await page.waitForSelector('#cmdIngresar', {
+          timeout: 20_000,
+          visible: true,
+        });
+        await page.click('#cmdIngresar');
+
+        await new Promise((resolve) => setTimeout(resolve, 15_000));
+
+        const afipError = await page
+          .evaluate(() =>
+            /Internal Server Error|Request enviado es inv/i.test(
+              document.body?.innerText || '',
+            ),
+          )
+          .catch(() => false);
+        if (!afipError) break;
+        if (attempt === MAX_UPLOAD_ATTEMPTS) {
+          throw new ConflictException(
+            `ARCA: Internal Server Error al subir el CSR (${MAX_UPLOAD_ATTEMPTS} intentos)`,
+          );
+        }
+        this.logger.warn(
+          `ARCA devolvió Internal Server Error al subir el CSR; reintento ${attempt}/${MAX_UPLOAD_ATTEMPTS - 1} en 30s`,
         );
+        await new Promise((resolve) => setTimeout(resolve, 30_000));
+        const aliasVacio = await page
+          .$eval('#txtAliasCertificado', (el) => !(el as HTMLInputElement).value)
+          .catch(() => true);
+        if (aliasVacio) await page.type('#txtAliasCertificado', alias);
       }
-      await fileInputHandle.uploadFile(filePath);
-      await page.waitForSelector('#cmdIngresar', {
-        timeout: 20_000,
-        visible: true,
-      });
-      await page.click('#cmdIngresar');
-
-      this.logger.error('Iniciando timeout');
-
-      await new Promise((resolve) => setTimeout(resolve, 15_000)); // Espera 15 segundos
-
-      this.logger.error('Terminando timeout');
 
       const downloadDir = join(
         process.cwd(), // en runtime, process.cwd() = /usr/src/app
@@ -1365,8 +1389,23 @@ export class ScrapperService {
         return;
       }
       await page.click('#F1\\:btnIngresar');
+      // Si AFIP rechaza la clave, el form vuelve con el error visible.
+      await new Promise((resolve) => setTimeout(resolve, 4_000));
+      const claveIncorrecta = await page
+        .evaluate(() =>
+          /Clave o usuario incorrecto|clave.*incorrect/i.test(
+            document.body?.innerText || '',
+          ),
+        )
+        .catch(() => false);
+      if (claveIncorrecta) {
+        throw new BadRequestException(
+          `AFIP: clave o usuario incorrecto para ${username}`,
+        );
+      }
       this.loggedIn = true;
     } catch (error) {
+      if (error instanceof BadRequestException) throw error;
       if (error.message.includes('Captcha activation')) {
         this.logger.error('Captcha activation, retrying...', error.message);
         throw new ConflictException('Captcha activation');
