@@ -993,7 +993,7 @@ export class ScrapperService {
       await page.waitForFunction(() => document.readyState === 'complete');
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       await page.waitForSelector('#buscadorInput', {
-        timeout: 12_000,
+        timeout: 60_000,
       });
       await page.type('#buscadorInput', serviceName);
       await page.click('#rbt-menu-item-0');
@@ -1409,8 +1409,11 @@ export class ScrapperService {
       // Modal "Recordar más tarde" (no abre popup → no pasamos browser aquí)
       await this.handleModalIfPresent(page, 'recordar mas tarde');
 
-      // Buscador
-      await page.waitForSelector('#buscadorInput', { timeout: 30_000 });
+      // Buscador (vía proxy el portal puede quedar en spinner bastante más de 30s)
+      await page.waitForSelector('#buscadorInput', { timeout: 90_000 }).catch((e) => {
+        this.markProxyBad('portal lento tras login');
+        throw e;
+      });
       await page.click('#buscadorInput', { delay: 20 });
       const isMac = await page.evaluate(() =>
         navigator.platform.includes('Mac'),
