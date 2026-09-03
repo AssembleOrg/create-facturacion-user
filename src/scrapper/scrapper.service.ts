@@ -73,7 +73,28 @@ export class ScrapperService {
       })
       .filter((x): x is NonNullable<typeof x> => Boolean(x));
     if (!entries.length) return undefined;
-    return entries[Math.floor(Math.random() * entries.length)];
+    // Cooldown: las IPs que fallaron (landing/login lentos) se saltean un rato.
+    const now = Date.now();
+    const healthy = entries.filter(
+      (e) => (this.proxyCooldown.get(e.server) ?? 0) <= now,
+    );
+    const pool = healthy.length ? healthy : entries;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  private proxyCooldown = new Map<string, number>();
+  private static readonly PROXY_COOLDOWN_MS = Number(
+    process.env.PROXY_COOLDOWN_MS || 30 * 60_000,
+  );
+
+  /** Marca la IP actual como mala: sale de rotación por PROXY_COOLDOWN_MS. */
+  private markProxyBad(reason: string) {
+    const s = this.currentProxy?.server;
+    if (!s) return;
+    this.proxyCooldown.set(s, Date.now() + ScrapperService.PROXY_COOLDOWN_MS);
+    this.logger.warn(
+      `Proxy ${s} en cooldown ${Math.round(ScrapperService.PROXY_COOLDOWN_MS / 60000)}min (${reason})`,
+    );
   }
 
   private launchOptions() {
@@ -135,6 +156,10 @@ export class ScrapperService {
   private async openLandingAndClickAcceso(): Promise<void> {
     const ACCESO = 'a.btn.btn-sm.btn-info.btn-block.uppercase';
     const MAX = 2;
+    // Estado por corrida: si no se resetea, un login fallido hereda el
+    // loggedIn=true del usuario anterior y sigue como si hubiera entrado.
+    this.loggedIn = false;
+    this.currentCertificatePage = undefined as unknown as Page;
     for (let attempt = 1; attempt <= MAX; attempt++) {
       this.browser = await this.launchBrowser();
       this.originalPage = await this.browser.newPage();
@@ -150,6 +175,7 @@ export class ScrapperService {
         this.logger.warn(
           `Landing AFIP no cargó (intento ${attempt}/${MAX}, proxy ${this.currentProxy?.server ?? 'directo'}): ${e?.message}`,
         );
+        this.markProxyBad('landing no cargó');
         await this.close();
         if (attempt === MAX) throw e;
         await new Promise((resolve) => setTimeout(resolve, 5_000));
@@ -1446,7 +1472,7 @@ export class ScrapperService {
       await page.click('#F1\\:btnSiguiente');
 
       await page.waitForSelector('#F1\\:password', {
-        timeout: 16_000,
+        timeout: 45_000,
       });
       await page.type('#F1\\:password', password);
       this.logger.log('Clicking login button...');
@@ -1511,7 +1537,29 @@ export class ScrapperService {
         throw new ConflictException('Captcha activation');
       }
       this.logger.error('Login failed, retrying...', error.message);
+      this.markProxyBad('login lento');
+      // Reintento completo: esperar el campo, tipear la clave e ingresar.
       await this.retryWithDelay(page, '#F1\\:password', 6_000);
+      await page.evaluate(() => {
+        const el = document.querySelector<HTMLInputElement>('#F1\\:password');
+        if (el) el.value = '';
+      });
+      await page.type('#F1\\:password', password);
+      await page.click('#F1\\:btnIngresar');
+      await new Promise((resolve) => setTimeout(resolve, 4_000));
+      const claveIncorrecta = await page
+        .evaluate(() =>
+          /Clave o usuario incorrecto|clave.*incorrect/i.test(
+            document.body?.innerText || '',
+          ),
+        )
+        .catch(() => false);
+      if (claveIncorrecta) {
+        throw new BadRequestException(
+          `AFIP: clave o usuario incorrecto para ${username}`,
+        );
+      }
+      this.loggedIn = true;
     }
   }
 
