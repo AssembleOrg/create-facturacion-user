@@ -1129,10 +1129,17 @@ export class ScrapperService {
           `ARCA devolvió Internal Server Error al subir el CSR; reintento ${attempt}/${MAX_UPLOAD_ATTEMPTS - 1} en 30s`,
         );
         await new Promise((resolve) => setTimeout(resolve, 30_000));
-        const aliasVacio = await page
-          .$eval('#txtAliasCertificado', (el) => !(el as HTMLInputElement).value)
-          .catch(() => true);
-        if (aliasVacio) await page.type('#txtAliasCertificado', alias);
+        // Alias nuevo por intento: reintentar con el mismo alias volvía a
+        // dar 500 (queda a medio crear del lado de ARCA), con uno fresco pasa.
+        this.currentAlias = `new-csr-${Date.now()}`;
+        await page.$eval(
+          '#txtAliasCertificado',
+          (el, v) => {
+            (el as HTMLInputElement).value = v as string;
+          },
+          this.currentAlias,
+        );
+        this.logger.warn(`Reintento con alias nuevo: ${this.currentAlias}`);
       }
 
       const downloadDir = join(
