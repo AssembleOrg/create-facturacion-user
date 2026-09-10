@@ -40,5 +40,7 @@ RUN npm run build
 # 8) Expone el puerto que use tu aplicación (por ejemplo 3000 para NestJS)
 EXPOSE 3000
 
-# 9) Comando por defecto para iniciar la aplicación compilada
-CMD ["node", "dist/main.js"]
+# 9) Comando por defecto para iniciar la aplicación compilada.
+# nest build emite en dist/src/main.js (hay .ts en la raíz — run-batch/run-nosp —
+# que hacen que tsc preserve la estructura), NO en dist/main.js.
+CMD ["node", "dist/src/main.js"]
