@@ -108,6 +108,11 @@ export class ScrapperService {
     return {
       headless,
       executablePath,
+      // En el contenedor (Railway) el proxy residencial + AFIP son más lentos
+      // que en local: sin un protocolTimeout amplio, `Network.enable` y otras
+      // llamadas CDP expiran a los 30s por defecto. Configurable con
+      // PUPPETEER_PROTOCOL_TIMEOUT (ms).
+      protocolTimeout: Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT ?? 180000),
       ignoreDefaultArgs: ['--enable-automation'],
       args: [
         '--no-sandbox',
