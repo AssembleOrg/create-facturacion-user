@@ -907,19 +907,30 @@ export class ScrapperService {
       // await newPage.click('#ctrl\\.org\\.afip\\.grp\\.webservices');
 
       await new Promise((resolve) => setTimeout(resolve, 5_000));
-      await newPage.evaluate(() => {
-        const td = Array.from(document.querySelectorAll('td')).find(
+      // El árbol de ARCA usa handlers de mouse en el elemento navegable. Un
+      // `HTMLElement.click()` sobre el `<td>` sólo disparaba un click sintético
+      // y, en algunas respuestas del portal, dejaba el árbol sin expandir.
+      // Marcamos el enlace (o el td si no hay wrapper) y hacemos un click real
+      // con Puppeteer.
+      const webServicesSelector = '[data-scrapper-webservices]';
+      const foundWebServices = await newPage.evaluate(() => {
+        const cell = Array.from(document.querySelectorAll('td')).find(
           (el) => el.textContent?.trim() === 'WebServices',
-        );
-        if (td) {
-          console.warn('CLICKIE SERVICE');
-          td.click();
-        }
-        if (!td)
-          throw new BadRequestException(
-            'No se encontró el enlace "WebServices"',
-          );
+        ) as HTMLElement | undefined;
+        const target = cell?.querySelector<HTMLElement>('a, button, img') ??
+          cell?.closest<HTMLElement>('a, button, [onclick]') ??
+          cell;
+        if (!target) return false;
+        target.setAttribute('data-scrapper-webservices', '');
+        target.scrollIntoView({ behavior: 'auto', block: 'center' });
+        return true;
       });
+      if (!foundWebServices) {
+        throw new BadRequestException(
+          'No se encontró el enlace "WebServices"',
+        );
+      }
+      await newPage.click(webServicesSelector);
       this.logger.warn('LLEGANDO A FACTURACION');
 
       await newPage.waitForSelector('#ctrl\\.org\\.afip\\.grp\\.webservices', {
@@ -1019,15 +1030,43 @@ export class ScrapperService {
       // await new Promise((resolve) => setTimeout(resolve, 300_000));
       await page.waitForFunction(() => document.readyState === 'complete');
       const multipleDropdown = '#tblAutoridadAplicacion_cmbCont';
+      // ARCA cambió el id del botón inicial en algunas cuentas: la vista
+      // actual muestra "Agregar alias" en lugar de #cmdIngresar. Lo buscamos
+      // por id legado o por texto/valor visible y hacemos un click real.
+      const enterAlias = async () => {
+        const selector = '[data-scrapper-enter-alias]';
+        const found = await page.evaluate(() => {
+          const normalize = (value: string | null | undefined) =>
+            (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const target = Array.from(
+            document.querySelectorAll<HTMLElement>(
+              'input[type="button"], input[type="submit"], input[type="image"], button, a',
+            ),
+          ).find((el) => {
+            const input = el as HTMLInputElement;
+            return (
+              el.id === 'cmdIngresar' ||
+              normalize(el.textContent).includes('agregar alias') ||
+              normalize(input.value).includes('agregar alias')
+            );
+          });
+          if (!target) return false;
+          target.setAttribute('data-scrapper-enter-alias', '');
+          target.scrollIntoView({ behavior: 'auto', block: 'center' });
+          return true;
+        });
+        if (!found) {
+          throw new ConflictException(
+            'No se encontró el botón "Agregar alias"',
+          );
+        }
+        await page.click(selector, { delay: 30 });
+      };
 
       try {
         await page.waitForSelector(multipleDropdown, { timeout: 16000 });
         await page.select(multipleDropdown, cuit);
-        await page.waitForSelector('#cmdIngresar', {
-          timeout: 20_000,
-          visible: true,
-        });
-        await page.click('#cmdIngresar');
+        await enterAlias();
       } catch (e) {
         this.logger.warn(
           'No se encontró el selector',
@@ -1053,11 +1092,7 @@ export class ScrapperService {
         //   );
         // }
 
-        await page.waitForSelector('#cmdIngresar', {
-          timeout: 20_000,
-          visible: true,
-        });
-        await page.click('#cmdIngresar');
+        await enterAlias();
       }
 
       await new Promise((resolve) => setTimeout(resolve, 10_000));
@@ -1469,6 +1504,10 @@ export class ScrapperService {
         this.logger.log(
           'Navegación a Certificados Digitales completada (misma pestaña)',
         );
+        // El resultado puede reemplazar el contenido del portal en vez de
+        // abrir un popup. Guardar explícitamente esa Page evita que el caller
+        // intente esperar una segunda pestaña que nunca va a existir.
+        this.currentCertificatePage = page;
       }
     } catch (error) {
       this.logger.error('Error navigating to Portal IVA:', error);
