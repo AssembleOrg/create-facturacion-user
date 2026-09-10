@@ -307,9 +307,16 @@ export class ScrapperService {
         newPage,
       );
 
-      // Mismo circuito que Facturación Electrónica pero eligiendo el
-      // servicio de Ventanilla; usa el computador fiscal ya existente.
-      await this.addServiceRelacion(user.username!, 'Ventanilla');
+      // Mismo circuito que Facturación Electrónica pero eligiendo el WEBSERVICE
+      // WSCCOMU, que en el árbol de AFIP/ARCA se llama "Consulta y lectura de
+      // Comunicaciones" (verificado 2026-09-10). OJO: NO usar sólo "Ventanilla":
+      // matchea primero "eVentanilla - Factura Electronica", que es un servicio
+      // INTERACTIVO (pide designar una persona física, no el computador fiscal)
+      // y por eso el flujo moría en #cmdSeleccionarServicio.
+      await this.addServiceRelacion(
+        user.username!,
+        'Consulta y lectura de Comunicaciones',
+      );
 
       await this.close();
     } catch (error) {
