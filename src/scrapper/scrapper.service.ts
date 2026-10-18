@@ -6,12 +6,16 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import puppeteer, {
+import {
+  chromium,
+  errors,
   Browser,
-  Page,
+  BrowserContext,
+  Download,
   ElementHandle,
-  TimeoutError,
-} from 'puppeteer';
+  Frame,
+  Page,
+} from 'playwright';
 import { setTimeout } from 'timers';
 import { SupabaseService } from 'src/supabase.service';
 import { CertService } from 'src/cert/cert.service';
@@ -24,6 +28,14 @@ import { Repository } from 'typeorm';
 @Injectable()
 export class ScrapperService {
   private browser: Browser;
+  /** Un contexto por corrida (cookies/descargas aisladas), dentro de `browser`. */
+  private context: BrowserContext;
+  /** Pestañas abiertas por nosotros (no popups de AFIP). */
+  private ownPages = new WeakSet<Page>();
+  /** Popups ya entregados por waitForNewPage (no se devuelven dos veces). */
+  private claimedPages = new WeakSet<Page>();
+  /** Momento en que apareció cada pestaña del contexto. */
+  private pageCreatedAt = new WeakMap<Page, number>();
   private originalPage: Page;
   private url = 'https://www.afip.gob.ar/landing/default.asp';
   private logger = new Logger('ScrapperService');
@@ -48,7 +60,7 @@ export class ScrapperService {
    * PROXY_POOL (mismo formato que profitos-next: `user:pass@host:port`
    * separados por coma) → se elige una entrada al azar por browser (rotación
    * residencial). BROWSER_EXECUTABLE → binario real (ej. Brave) en lugar del
-   * Chromium bundle de puppeteer.
+   * Chromium bundle de Playwright.
    */
   private currentProxy?: { server: string; username?: string; password?: string };
 
@@ -108,49 +120,73 @@ export class ScrapperService {
     return {
       headless,
       executablePath,
-      // En el contenedor (Railway) el proxy residencial + AFIP son más lentos
-      // que en local: sin un protocolTimeout amplio, `Network.enable` y otras
-      // llamadas CDP expiran a los 30s por defecto. Configurable con
-      // PUPPETEER_PROTOCOL_TIMEOUT (ms).
-      protocolTimeout: Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT ?? 180000),
+      // Headless con el Chromium completo (modo headless nuevo, el mismo que
+      // usaba puppeteer 24) y no el chromium-headless-shell por defecto de
+      // Playwright. Con BROWSER_EXECUTABLE manda el binario indicado.
+      channel: executablePath ? undefined : 'chromium',
+      // Antes era el protocolTimeout de puppeteer (180s) para el contenedor
+      // lento; en Playwright no hay timeout por llamada CDP, sólo el del launch.
+      timeout: Number(process.env.BROWSER_LAUNCH_TIMEOUT_MS ?? 180000),
       ignoreDefaultArgs: ['--enable-automation'],
+      // Proxy con credenciales: Playwright las responde solo en todas las
+      // pestañas (popups de AFIP incluidos); reemplaza a page.authenticate.
+      proxy: this.currentProxy
+        ? {
+            server: this.currentProxy.server,
+            username: this.currentProxy.username,
+            password: this.currentProxy.password,
+          }
+        : undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        // chrome_crashpad_handler sobrevive a browser.close(): un huérfano por
+        // launch (lección de multas-next / afip-hub).
+        '--disable-crashpad',
         '--disable-blink-features=AutomationControlled',
         '--lang=es-AR',
         '--no-first-run',
         '--no-default-browser-check',
-        ...(this.currentProxy
-          ? [`--proxy-server=${this.currentProxy.server}`]
-          : []),
-        ...(headless ? ['--single-process', '--no-zygote'] : []),
+        // Sin --single-process/--no-zygote: Playwright no soporta single-process
+        // (los contextos/popups se caen). En la imagen de Playwright no hacen falta.
       ],
     };
   }
 
   /**
-   * Lanza el browser y, si hay proxy con credenciales, autentica cada pestaña
-   * (las que abre AFIP por popup incluidas) vía page.authenticate.
+   * Lanza un browser propio para la corrida y le abre UN contexto (equivale
+   * al perfil limpio que tenía cada puppeteer.launch). Viewport 800x600 =
+   * el default de puppeteer, para que el portal se vea igual que antes.
    */
   private async launchBrowser(): Promise<Browser> {
-    const browser = await puppeteer.launch(this.launchOptions());
-    const proxy = this.currentProxy;
-    if (proxy?.username) {
-      const creds = { username: proxy.username, password: proxy.password ?? '' };
-      const auth = async (p: Page | null) => {
-        if (!p) return;
-        await p.authenticate(creds).catch((e) =>
-          this.logger.warn(`page.authenticate falló: ${e?.message}`),
-        );
-      };
-      for (const p of await browser.pages()) await auth(p);
-      browser.on('targetcreated', async (t) => {
-        if (t.type() !== 'page') return;
-        await auth(await t.page().catch(() => null));
-      });
-    }
+    const browser = await chromium.launch(this.launchOptions());
+    const context = await browser.newContext({
+      acceptDownloads: true,
+      viewport: { width: 800, height: 600 },
+      locale: 'es-AR',
+    });
+    context.on('page', (p) => this.trackPage(p));
+    this.context = context;
     return browser;
+  }
+
+  /** Registra cada pestaña nueva y deja asentado cualquier diálogo nativo. */
+  private trackPage(p: Page) {
+    this.pageCreatedAt.set(p, Date.now());
+    // Sin listener Playwright descarta los diálogos en silencio (puppeteer los
+    // dejaba abiertos y la página se colgaba). Se descartan igual, pero logueado.
+    p.on('dialog', (d) => {
+      this.logger.warn(`Diálogo ${d.type()} en ${p.url()}: ${d.message()}`);
+      d.dismiss().catch(() => {});
+    });
+  }
+
+  /** Pestaña nueva abierta por nosotros (no cuenta como popup de AFIP). */
+  private async newOwnPage(): Promise<Page> {
+    const p = await this.context.newPage();
+    this.ownPages.add(p);
+    return p;
   }
 
   /**
@@ -167,13 +203,16 @@ export class ScrapperService {
     this.currentCertificatePage = undefined as unknown as Page;
     for (let attempt = 1; attempt <= MAX; attempt++) {
       this.browser = await this.launchBrowser();
-      this.originalPage = await this.browser.newPage();
+      this.originalPage = await this.newOwnPage();
       try {
         await this.originalPage.goto(this.url, {
           waitUntil: 'domcontentloaded',
           timeout: 60_000,
         });
-        await this.originalPage.waitForSelector(ACCESO, { timeout: 30_000 });
+        await this.originalPage.waitForSelector(ACCESO, {
+          state: 'attached',
+          timeout: 30_000,
+        });
         await this.originalPage.click(ACCESO);
         return;
       } catch (e) {
@@ -260,7 +299,8 @@ export class ScrapperService {
       jobs.push({ username, jobId: job.id });
     }
 
-    // Secuencial en background: puppeteer no tolera sesiones en paralelo acá.
+    // Secuencial en background: el scrapper guarda browser/contexto/páginas en
+    // la instancia (un solo flujo a la vez), así que NO se paraleliza.
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
     (async () => {
       for (const j of jobs) {
@@ -299,7 +339,7 @@ export class ScrapperService {
 
       await this.openLandingAndClickAcceso();
 
-      const newPage: Page = await this.getNewPage(this.browser);
+      const newPage: Page = await this.getNewPage(this.context);
       await this.loginToAfip(newPage, user.username!, user.password);
       if (!this.loggedIn) {
         throw new InternalServerErrorException(
@@ -480,15 +520,15 @@ export class ScrapperService {
   /** Captura todas las pestañas abiertas en static/errors/<cuit>-<n>.png para diagnóstico. */
   private async screenshotAllPages(tag: string): Promise<void> {
     try {
-      if (!this.browser) return;
+      if (!this.browser || !this.context) return;
       const dir = join(process.cwd(), 'static', 'errors');
       mkdirSync(dir, { recursive: true });
-      const pages = await this.browser.pages();
+      const pages = this.context.pages();
       for (let i = 0; i < pages.length; i++) {
         const p = pages[i];
         const file = join(dir, `${tag}-${Date.now()}-${i}.png`);
         try {
-          await p.screenshot({ path: file as `${string}.png`, fullPage: true });
+          await p.screenshot({ path: file, fullPage: true });
           this.logger.warn(`Screenshot ${file} (${p.url()})`);
         } catch (e) {
           this.logger.warn(`No se pudo capturar pestaña ${i}: ${e?.message}`);
@@ -506,7 +546,7 @@ export class ScrapperService {
   ): Promise<void> {
     await this.openLandingAndClickAcceso();
 
-    const newPage: Page = await this.getNewPage(this.browser);
+    const newPage: Page = await this.getNewPage(this.context);
 
     await this.loginToAfip(newPage, usuario, password);
     if (!this.loggedIn) {
@@ -520,7 +560,7 @@ export class ScrapperService {
 
     // Usar la página de certificados que se abrió, o obtener una nueva si es necesario
     const pageAlias =
-      this.currentCertificatePage || (await this.getNewPage(this.browser));
+      this.currentCertificatePage || (await this.getNewPage(this.context));
     const today = new Date();
     const miliseconds = today.getTime();
     this.currentAlias = `new-csr-${miliseconds}`;
@@ -532,7 +572,7 @@ export class ScrapperService {
 
     await newPage.bringToFront();
 
-    const popupRelaciones = this.waitForNewPage(this.browser, {
+    const popupRelaciones = this.waitForNewPage(this.context, {
       timeoutMs: 30_000,
       mustHaveOpener: true,
     });
@@ -549,7 +589,7 @@ export class ScrapperService {
     await newPage.bringToFront();
     // La espera del popup se arma ANTES del click del buscador para no
     // perder la pestaña si abre rápido.
-    const popupPuntosVenta = this.waitForNewPage(this.browser, {
+    const popupPuntosVenta = this.waitForNewPage(this.context, {
       timeoutMs: 30_000,
       mustHaveOpener: true,
     });
@@ -574,14 +614,19 @@ export class ScrapperService {
     let p = await popupPromise;
     if (!p) {
       this.logger.warn('Sin popup; verifico modal "Continuar"...');
-      p = await this.handleModalIfPresent(portalPage, 'continuar', this.browser, {
-        timeoutMs: 15_000,
-      });
+      p = await this.handleModalIfPresent(
+        portalPage,
+        'continuar',
+        this.context,
+        {
+          timeoutMs: 15_000,
+        },
+      );
     }
     if (!p) {
       this.logger.warn('Sin popup ni modal; pruebo misma pestaña...');
       const ok = await portalPage
-        .waitForSelector(readySelector, { timeout: 15_000 })
+        .waitForSelector(readySelector, { state: 'attached', timeout: 15_000 })
         .then(() => true)
         .catch(() => false);
       if (!ok) {
@@ -592,7 +637,9 @@ export class ScrapperService {
       p = portalPage;
     }
     await p.bringToFront().catch(() => {});
-    await p.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
+    await p
+      .waitForSelector('body', { state: 'attached', timeout: 10_000 })
+      .catch(() => {});
     return p;
   }
 
@@ -612,7 +659,9 @@ export class ScrapperService {
       const tokens = nameOnDb.split(/\s+/).map((t) => t.toUpperCase());
 
       // 2) Espera a que estén cargados todos los inputs de tipo botón
-      await newPage.waitForSelector('td[align="center"] input[type="button"]');
+      await newPage.waitForSelector('td[align="center"] input[type="button"]', {
+        state: 'attached',
+      });
 
       // 3) Obtén todos los botones y revisa su atributo `value`
       const buttons = await newPage.$$(
@@ -624,7 +673,7 @@ export class ScrapperService {
       let clicked = false;
       for (const btn of buttons) {
         // 4) Lee el atributo `value` de cada botón y pásalo a minúsculas
-        const val = await (await btn.getProperty('value')).jsonValue();
+        const val: string = await (await btn.getProperty('value')).jsonValue();
 
         // 5) Comprueba si alguno de los tokens aparece en `val`
         if (tokens.some((token) => val.includes(token))) {
@@ -643,6 +692,7 @@ export class ScrapperService {
 
       const btn_abm_pto_vta = '#btn_abm_pto_vta';
       await newPage.waitForSelector(btn_abm_pto_vta, {
+        state: 'attached',
         timeout: 16_000,
       });
       await newPage.click(btn_abm_pto_vta);
@@ -650,14 +700,14 @@ export class ScrapperService {
       const dlgAdvertencias_btn_Cerrar = '#dlgAdvertencias_btn_Cerrar';
       await newPage.waitForSelector(dlgAdvertencias_btn_Cerrar, {
         timeout: 16_000,
-        visible: true,
+        state: 'visible',
       });
       await newPage.click(dlgAdvertencias_btn_Cerrar);
 
       const buscado = 'Factura Electronica - Monotributo - Web Services';
 
       // Espera a que haya algún <td> en la página
-      await newPage.waitForSelector('td');
+      await newPage.waitForSelector('td', { state: 'attached' });
 
       // Comprueba si alguno de los <td> tiene ese texto (ignorando espacios al inicio/final)
       const existeTd = await newPage.evaluate((buscado) => {
@@ -671,6 +721,7 @@ export class ScrapperService {
         this.logger.verbose('Creando punto de venta');
         const tblmiGrilla_totalRecords = '#tblmiGrilla_totalRecords';
         await newPage.waitForSelector(tblmiGrilla_totalRecords, {
+          state: 'attached',
           timeout: 16_000,
         });
         // Próximo número = max(puntos de venta existentes en la grilla) + 1.
@@ -705,7 +756,7 @@ export class ScrapperService {
         );
 
         const [btn] = await newPage.$$(
-          `xpath/ .//span[@class="ui-button-text" and normalize-space(text())="Agregar.."]`,
+          `xpath=//span[@class="ui-button-text" and normalize-space(text())="Agregar.."]`,
         );
         if (!btn) {
           this.logger.error('No se encontró el botón "Agregar.."');
@@ -720,6 +771,7 @@ export class ScrapperService {
 
         const frmAlta_pveNro = '#frmAlta_pveNro';
         await newPage.waitForSelector(frmAlta_pveNro, {
+          state: 'attached',
           timeout: 16_000,
         });
         const nuevoPuntoVenta = Math.max(maxPv, totalRecords) + 1;
@@ -728,26 +780,32 @@ export class ScrapperService {
             `Número de punto de venta inválido: ${nuevoPuntoVenta}`,
           );
         }
-        await newPage.type(frmAlta_pveNro, nuevoPuntoVenta.toString());
+        await this.typeInto(
+          newPage,
+          frmAlta_pveNro,
+          nuevoPuntoVenta.toString(),
+        );
         this.logger.log(
           `Tipeando número de punto de venta: ${nuevoPuntoVenta}`,
         );
 
         const frmAlta_sisCodigo = '#frmAlta_sisCodigo';
         await newPage.waitForSelector(frmAlta_sisCodigo, {
+          state: 'attached',
           timeout: 16_000,
         });
-        await newPage.select(frmAlta_sisCodigo, 'MAW');
+        await this.selectValue(newPage, frmAlta_sisCodigo, 'MAW');
         this.logger.log('Seleccionado sistema: MAW');
 
         const frmAlta_codTipoDomicilio = '#frmAlta_codTipoDomicilio';
         await newPage.waitForSelector(frmAlta_codTipoDomicilio, {
+          state: 'attached',
           timeout: 16_000,
         });
-        await newPage.select(frmAlta_codTipoDomicilio, '1-1');
+        await this.selectValue(newPage, frmAlta_codTipoDomicilio, '1-1');
         this.logger.log('Seleccionado tipo de domicilio: 1-1');
 
-        const xpath = `xpath/ .//span[@class="ui-button-text" and normalize-space(text())="Aceptar"]`;
+        const xpath = `xpath=//span[@class="ui-button-text" and normalize-space(text())="Aceptar"]`;
 
         // 3) Obtén el primer nodo y haz click
         const [spanAceptar] = await newPage.$$(xpath);
@@ -765,7 +823,7 @@ export class ScrapperService {
         const JqueryInfoDialog_btnYes = '#JqueryInfoDialog_btnYes';
         await newPage.waitForSelector(JqueryInfoDialog_btnYes, {
           timeout: 16_000,
-          visible: true,
+          state: 'visible',
         });
         await newPage.click(JqueryInfoDialog_btnYes);
         this.logger.log('Click en confirmación realizado');
@@ -777,7 +835,9 @@ export class ScrapperService {
         );
       } else {
         this.logger.verbose('Punto de venta ya existe');
-        await newPage.waitForSelector('#tblmiGrilla_dataTable');
+        await newPage.waitForSelector('#tblmiGrilla_dataTable', {
+          state: 'attached',
+        });
 
         // Evaluate in the browser context
         const numero = await newPage.evaluate(() => {
@@ -825,22 +885,27 @@ export class ScrapperService {
             opened.popupPromise,
             '#cmdNuevaRelacion, #tblAutoridadAplicacion_cmbCont',
           )
-        : await this.getNewPage(this.browser);
+        : await this.getNewPage(this.context);
       // await new Promise((resolve) => setTimeout(resolve, 300_000));
       const multipleDropdown = '#tblAutoridadAplicacion_cmbCont';
       try {
-        await newPage.waitForSelector(multipleDropdown, { timeout: 10_000 });
-        await newPage.select(multipleDropdown, cuit);
+        await newPage.waitForSelector(multipleDropdown, {
+          state: 'attached',
+          timeout: 10_000,
+        });
+        await this.selectValue(newPage, multipleDropdown, cuit);
         await newPage.waitForSelector('#cmdNuevaRelacion', {
+          state: 'attached',
           timeout: 10_000,
         });
         await newPage.click('#cmdNuevaRelacion');
         await new Promise((resolve) => setTimeout(resolve, 2_000));
         const cboRepresentado = '#cboRepresentado';
         await newPage.waitForSelector(cboRepresentado, {
+          state: 'attached',
           timeout: 3_000,
         });
-        await newPage.select(cboRepresentado, cuit);
+        await this.selectValue(newPage, cboRepresentado, cuit);
       } catch (e) {
         this.logger.warn(
           'No se encontró el selector',
@@ -849,11 +914,13 @@ export class ScrapperService {
         );
 
         await newPage.waitForSelector('#cmdNuevaRelacion', {
+          state: 'attached',
           timeout: 10_000,
         });
         await newPage.click('#cmdNuevaRelacion');
 
         await newPage.waitForSelector('#tblDetalleRelacion_lblRepresentado', {
+          state: 'attached',
           timeout: 10_000,
         });
 
@@ -878,13 +945,14 @@ export class ScrapperService {
 
       const cmdBuscarServicio = '#cmdBuscarServicio';
       await newPage.waitForSelector(cmdBuscarServicio, {
+        state: 'attached',
         timeout: 30_000,
       });
       await newPage.click(cmdBuscarServicio);
       // Vía proxy el árbol de servicios puede tardar más que un sleep fijo.
       await newPage.waitForSelector(
         'img[alt="Agencia de Recaudación y Control Aduanero"]',
-        { timeout: 60_000 },
+        { state: 'attached', timeout: 60_000 },
       );
       await new Promise((resolve) => setTimeout(resolve, 2_000));
 
@@ -923,7 +991,7 @@ export class ScrapperService {
       // `HTMLElement.click()` sobre el `<td>` sólo disparaba un click sintético
       // y, en algunas respuestas del portal, dejaba el árbol sin expandir.
       // Marcamos el enlace (o el td si no hay wrapper) y hacemos un click real
-      // con Puppeteer.
+      // del navegador (page.click).
       const webServicesSelector = '[data-scrapper-webservices]';
       const foundWebServices = await newPage.evaluate(() => {
         const cell = Array.from(document.querySelectorAll('td')).find(
@@ -946,7 +1014,7 @@ export class ScrapperService {
       this.logger.warn('LLEGANDO A FACTURACION');
 
       await newPage.waitForSelector('#ctrl\\.org\\.afip\\.grp\\.webservices', {
-        visible: true,
+        state: 'visible',
         timeout: 30_000,
       });
 
@@ -968,7 +1036,7 @@ export class ScrapperService {
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       await newPage.waitForSelector(cmdBuscarUsuario, {
         timeout: 30_000,
-        visible: true,
+        state: 'visible',
       });
       await newPage.click(cmdBuscarUsuario);
       await new Promise((resolve) => setTimeout(resolve, 10_000));
@@ -990,14 +1058,14 @@ export class ScrapperService {
       const cmdSeleccionarServicio = '#cmdSeleccionarServicio';
       await newPage.waitForSelector(cmdSeleccionarServicio, {
         timeout: 30_000,
-        visible: true,
+        state: 'visible',
       });
       await newPage.click(cmdSeleccionarServicio);
       await new Promise((resolve) => setTimeout(resolve, 5_000));
       const cmdGenerarRelacion = '#cmdGenerarRelacion';
       await newPage.waitForSelector(cmdGenerarRelacion, {
         timeout: 30_000,
-        visible: true,
+        state: 'visible',
       });
       await newPage.click(cmdGenerarRelacion);
       await new Promise((resolve) => setTimeout(resolve, 5_000));
@@ -1016,9 +1084,10 @@ export class ScrapperService {
       await page.waitForFunction(() => document.readyState === 'complete');
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       await page.waitForSelector('#buscadorInput', {
+        state: 'attached',
         timeout: 60_000,
       });
-      await page.type('#buscadorInput', serviceName);
+      await this.typeInto(page, '#buscadorInput', serviceName);
       await page.click('#rbt-menu-item-0');
     } catch (error) {
       console.error('Error in findService:', error);
@@ -1076,8 +1145,11 @@ export class ScrapperService {
       };
 
       try {
-        await page.waitForSelector(multipleDropdown, { timeout: 16000 });
-        await page.select(multipleDropdown, cuit);
+        await page.waitForSelector(multipleDropdown, {
+          state: 'attached',
+          timeout: 16000,
+        });
+        await this.selectValue(page, multipleDropdown, cuit);
         await enterAlias();
       } catch (e) {
         this.logger.warn(
@@ -1109,16 +1181,18 @@ export class ScrapperService {
 
       await new Promise((resolve) => setTimeout(resolve, 10_000));
       await page.waitForSelector('#txtAliasCertificado', {
+        state: 'attached',
         timeout: 20_000,
       });
       await new Promise((resolve) => setTimeout(resolve, 3_000));
-      await page.type('#txtAliasCertificado', alias);
+      await this.typeInto(page, '#txtAliasCertificado', alias);
       await page.waitForSelector('#archivo', {
+        state: 'attached',
         timeout: 20_000,
       });
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       const idInput = '#archivo';
-      await page.waitForSelector(idInput, { visible: true });
+      await page.waitForSelector(idInput, { state: 'visible' });
       const filePath = join(
         process.cwd(), // en runtime, process.cwd() = /usr/src/app
         'static',
@@ -1131,24 +1205,24 @@ export class ScrapperService {
       // form queda en pantalla con el alias cargado: se reintenta la subida.
       const MAX_UPLOAD_ATTEMPTS = 3;
       for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
-        const fileInputHandle = (await page.$(
-          idInput,
-        )) as ElementHandle<HTMLInputElement>;
+        const fileInputHandle = await page.$(idInput);
         if (!fileInputHandle) {
           throw new ConflictException(
             `No se encontró el input con selector ${idInput}`,
           );
         }
-        await fileInputHandle.uploadFile(filePath);
+        await fileInputHandle.setInputFiles(filePath);
         await page.waitForSelector('#cmdIngresar', {
           timeout: 20_000,
-          visible: true,
+          state: 'visible',
         });
         // Esperar la respuesta real del POST (vía proxy puede superar 15s),
         // no un sleep fijo: si no, el chequeo ve el form viejo sin error.
-        const nav = page
-          .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 90_000 })
-          .catch(() => null);
+        const nav = this.waitForMainFrameNavigation(
+          page,
+          'domcontentloaded',
+          90_000,
+        ).catch(() => null);
         await page.click('#cmdIngresar');
         await nav;
         await new Promise((resolve) => setTimeout(resolve, 3_000));
@@ -1156,9 +1230,9 @@ export class ScrapperService {
         // El mensaje puede estar en un iframe: se revisa el HTML de todos los
         // frames de todas las pestañas (la de certificados puede no ser `page`).
         const ERR_RE = /Internal Server Error|Request enviado es inv/i;
-        let frames: ReturnType<Page['frames']> = [];
+        let frames: Frame[] = [];
         try {
-          frames = (await this.browser.pages()).flatMap((p) => p.frames());
+          frames = this.context.pages().flatMap((p) => p.frames());
         } catch {
           frames = page.frames();
         }
@@ -1205,14 +1279,16 @@ export class ScrapperService {
         'static',
         'downloads',
       );
-      const client = await page.createCDPSession();
-      await client.send('Page.setDownloadBehavior', {
-        behavior: 'allow',
-        downloadPath: downloadDir,
-      });
+      // Antes: CDP Page.setDownloadBehavior → Chrome guardaba solo en
+      // downloadDir. Playwright guarda las descargas en un temporal que se
+      // borra al cerrar el contexto: se captura el evento `download` y se
+      // copia a downloadDir con el nombre sugerido (ver más abajo).
 
       // La grilla de certificados a veces tarda >30s en volver tras el alta.
-      await page.waitForSelector('table', { visible: true, timeout: 90_000 });
+      await page.waitForSelector('table', {
+        state: 'visible',
+        timeout: 90_000,
+      });
 
       const matchingTrHandle = await page.evaluateHandle((alias) => {
         const tables = Array.from(
@@ -1261,9 +1337,20 @@ export class ScrapperService {
 
       await page.waitForSelector('input[alt="Descargar"]', {
         timeout: 40_000,
-        visible: true,
+        state: 'visible',
       });
+      const download = this.waitForDownload(60_000);
       await page.click('input[alt="Descargar"]');
+      const file = await download;
+      if (file) {
+        const target = join(downloadDir, file.suggestedFilename());
+        await file.saveAs(target);
+        this.logger.log(`Certificado descargado en ${target}`);
+      } else {
+        // Igual que antes: si no bajó nada, falla más adelante con
+        // "No se encontraron archivos en downloads o uploads".
+        this.logger.error('No llegó la descarga del certificado');
+      }
     } catch (error) {
       if (error instanceof BadRequestException) {
         throw error;
@@ -1273,16 +1360,22 @@ export class ScrapperService {
     }
   }
 
-  private async getNewPage(browser: Browser): Promise<Page> {
+  private async getNewPage(context: BrowserContext): Promise<Page> {
     try {
       this.logger.log('Opening new page...');
-      const p = await this.waitForNewPage(browser, {
+      // Se llama DESPUÉS del click que abre el popup: se acepta también uno
+      // que haya aparecido hace poco y nadie tomó (Playwright puede devolver
+      // el click después de crear la pestaña).
+      const p = await this.waitForNewPage(context, {
         timeoutMs: 12_000,
         mustHaveOpener: true,
+        acceptRecentMs: 15_000,
       });
       if (!p) throw new ConflictException('Timeout waiting for new page');
       await p.bringToFront().catch(() => {});
-      await p.waitForSelector('body', { timeout: 10_000 }).catch(() => {});
+      await p
+        .waitForSelector('body', { state: 'attached', timeout: 10_000 })
+        .catch(() => {});
       this.logger.log('New page opened.');
       return p;
     } catch (error) {
@@ -1291,43 +1384,147 @@ export class ScrapperService {
     }
   }
 
-  /** Espera una nueva Page creada después de registrarse (sin carreras). */
+  /**
+   * Espera una nueva Page creada después de registrarse (sin carreras).
+   * `mustHaveOpener` = popup de AFIP (no una pestaña abierta por nosotros).
+   * `acceptRecentMs` = además acepta un popup aún no tomado que haya
+   * aparecido en esa ventana previa al llamado.
+   */
   private waitForNewPage(
-    browser: Browser,
+    context: BrowserContext,
     opts: {
       timeoutMs?: number;
       mustHaveOpener?: boolean;
       urlPredicate?: (u: string) => boolean;
+      acceptRecentMs?: number;
     } = {},
   ): Promise<Page | null> {
-    const { timeoutMs = 12_000, mustHaveOpener = true, urlPredicate } = opts;
+    const {
+      timeoutMs = 12_000,
+      mustHaveOpener = true,
+      urlPredicate,
+      acceptRecentMs = 0,
+    } = opts;
+
+    const accepts = (p: Page) => {
+      if (p.isClosed() || this.claimedPages.has(p)) return false;
+      if (mustHaveOpener && this.ownPages.has(p)) return false;
+      if (urlPredicate && !urlPredicate(p.url())) return false;
+      return true;
+    };
 
     return new Promise((resolve) => {
-      const onCreated = async (t: any) => {
-        try {
-          if (t.type() !== 'page') return;
-          if (mustHaveOpener && !t.opener()) return;
-          const p = await t.page();
-          if (!p) return;
-          if (urlPredicate && !urlPredicate(t.url())) return;
-          cleanup();
-          resolve(p);
-        } catch {
-          /* seguir escuchando */
-        }
+      let done = false;
+      const finish = (p: Page | null) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        if (p) this.claimedPages.add(p);
+        resolve(p);
       };
 
-      const timer = setTimeout(() => {
-        cleanup();
-        resolve(null);
-      }, timeoutMs);
+      const onPage = (p: Page) => {
+        // ownPages se marca al volver context.newPage(), que resuelve después
+        // del evento: se difiere un tick para no confundirla con un popup.
+        setImmediate(() => {
+          if (accepts(p)) finish(p);
+        });
+      };
+
+      const timer = setTimeout(() => finish(null), timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
-        browser.off('targetcreated', onCreated);
+        context.off('page', onPage);
       };
 
-      browser.on('targetcreated', onCreated);
+      context.on('page', onPage);
+
+      if (acceptRecentMs > 0) {
+        const since = Date.now() - acceptRecentMs;
+        const recent = context
+          .pages()
+          .find((p) => (this.pageCreatedAt.get(p) ?? 0) >= since && accepts(p));
+        if (recent) finish(recent);
+      }
     });
+  }
+
+  /**
+   * Espera la próxima navegación del frame principal (equivale a
+   * page.waitForNavigation de puppeteer) y luego el load state pedido.
+   */
+  private async waitForMainFrameNavigation(
+    page: Page,
+    waitUntil: 'domcontentloaded' | 'load' | 'networkidle',
+    timeout: number,
+  ): Promise<void> {
+    await page.waitForEvent('framenavigated', {
+      predicate: (f) => f === page.mainFrame(),
+      timeout,
+    });
+    await page.waitForLoadState(waitUntil, { timeout });
+  }
+
+  /**
+   * Primera descarga que aparezca en cualquier pestaña del contexto (la de
+   * certificados u otra que abra AFIP). null si no llega en `timeoutMs`.
+   */
+  private waitForDownload(timeoutMs: number): Promise<Download | null> {
+    const context = this.context;
+    return new Promise((resolve) => {
+      const watched: Page[] = [];
+      const onDownload = (d: Download) => finish(d);
+      const watch = (p: Page) => {
+        watched.push(p);
+        p.on('download', onDownload);
+      };
+      const finish = (d: Download | null) => {
+        clearTimeout(timer);
+        context.off('page', watch);
+        for (const p of watched) p.off('download', onDownload);
+        resolve(d);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      context.pages().forEach(watch);
+      context.on('page', watch);
+    });
+  }
+
+  /**
+   * Tipeo tecla por tecla (como page.type de puppeteer): el portal escucha
+   * eventos de teclado (buscador con sugerencias, formularios JSF).
+   */
+  private async typeInto(
+    page: Page,
+    selector: string,
+    text: string,
+    opts: { delay?: number } = {},
+  ): Promise<void> {
+    await page.locator(selector).first().pressSequentially(text, opts);
+  }
+
+  /**
+   * Como page.select de puppeteer: si la opción no existe NO falla (no
+   * selecciona nada). selectOption de Playwright esperaría hasta el timeout.
+   */
+  private async selectValue(
+    page: Page,
+    selector: string,
+    value: string,
+  ): Promise<void> {
+    const exists = await page.$eval(
+      selector,
+      (el, v) =>
+        Array.from((el as HTMLSelectElement).options).some(
+          (o) => o.value === v,
+        ),
+      value,
+    );
+    if (!exists) {
+      this.logger.warn(`Opción "${value}" no existe en ${selector}`);
+      return;
+    }
+    await page.selectOption(selector, { value });
   }
 
   /** Click por texto visible dentro de un contenedor, con click real (no $$eval). */
@@ -1392,7 +1589,7 @@ export class ScrapperService {
   private async handleModalIfPresent(
     page: Page,
     buttonText: string,
-    browser?: Browser, // si pasás browser, esperará popup
+    context?: BrowserContext, // si pasás el contexto, esperará popup
     opts: { timeoutMs?: number } = {},
   ): Promise<Page | null> {
     const { timeoutMs = 12_000 } = opts;
@@ -1409,8 +1606,8 @@ export class ScrapperService {
     this.logger.log(`Modal encontrada, buscando botón "${buttonText}"...`);
 
     let waitPopup: Promise<Page | null> | null = null;
-    if (browser)
-      waitPopup = this.waitForNewPage(browser, {
+    if (context)
+      waitPopup = this.waitForNewPage(context, {
         timeoutMs,
         mustHaveOpener: true,
       });
@@ -1436,7 +1633,10 @@ export class ScrapperService {
           await popup.bringToFront();
         } catch {}
         try {
-          await popup.waitForSelector('body', { timeout: 10_000 });
+          await popup.waitForSelector('body', {
+            state: 'attached',
+            timeout: 10_000,
+          });
         } catch {}
       }
     }
@@ -1453,14 +1653,19 @@ export class ScrapperService {
       await page.waitForFunction(() => document.readyState === 'complete');
       await new Promise((res) => setTimeout(res, 500));
 
-      // Modal "Recordar más tarde" (no abre popup → no pasamos browser aquí)
+      // Modal "Recordar más tarde" (no abre popup → no pasamos contexto aquí)
       await this.handleModalIfPresent(page, 'recordar mas tarde');
 
       // Buscador (vía proxy el portal puede quedar en spinner bastante más de 30s)
-      await page.waitForSelector('#buscadorInput', { timeout: 90_000 }).catch((e) => {
-        this.markProxyBad('portal lento tras login');
-        throw e;
-      });
+      await page
+        .waitForSelector('#buscadorInput', {
+          state: 'attached',
+          timeout: 90_000,
+        })
+        .catch((e) => {
+          this.markProxyBad('portal lento tras login');
+          throw e;
+        });
       await page.click('#buscadorInput', { delay: 20 });
       const isMac = await page.evaluate(() =>
         navigator.platform.includes('Mac'),
@@ -1468,16 +1673,20 @@ export class ScrapperService {
       await page.keyboard.down(isMac ? 'Meta' : 'Control');
       await page.keyboard.press('KeyA');
       await page.keyboard.up(isMac ? 'Meta' : 'Control');
-      await page.type(
+      await this.typeInto(
+        page,
         '#buscadorInput',
         'Administración de Certificados Digitales',
         { delay: 50 },
       );
 
-      await page.waitForSelector('#rbt-menu-item-0', { timeout: 15_000 });
+      await page.waitForSelector('#rbt-menu-item-0', {
+        state: 'attached',
+        timeout: 15_000,
+      });
 
       // 1) Intento 1: el click del resultado abre popup
-      const waitPopup = this.waitForNewPage(this.browser, {
+      const waitPopup = this.waitForNewPage(this.context, {
         timeoutMs: 12_000,
         mustHaveOpener: true,
       });
@@ -1493,16 +1702,16 @@ export class ScrapperService {
         newPage = await this.handleModalIfPresent(
           page,
           'continuar',
-          this.browser,
+          this.context,
           { timeoutMs: 12_000 },
         );
 
         // 3) Si tampoco hubo popup, esperá navegación en la misma pestaña (fallback)
         if (!newPage) {
           await Promise.race([
-            page
-              .waitForNavigation({ waitUntil: 'networkidle0', timeout: 8_000 })
-              .catch(() => null),
+            this.waitForMainFrameNavigation(page, 'networkidle', 8_000).catch(
+              () => null,
+            ),
             new Promise((res) => setTimeout(res, 1200)),
           ]);
         }
@@ -1537,30 +1746,35 @@ export class ScrapperService {
       // readyState 'complete' puede no llegar nunca vía proxy (algún recurso
       // colgado); no es requisito para el form: se espera acotado y se sigue.
       await page
-        .waitForFunction(() => document.readyState === 'complete', {
+        .waitForFunction(() => document.readyState === 'complete', undefined, {
           timeout: 20_000,
         })
         .catch(() => this.logger.warn('readyState no llegó a complete; sigo'));
       this.logger.log('Waiting for username...');
       await page.waitForSelector('#F1\\:username', {
+        state: 'attached',
         timeout: 45_000,
       });
-      await page.type('#F1\\:username', username);
+      await this.typeInto(page, '#F1\\:username', username);
       await page.click('#F1\\:btnSiguiente');
 
       await page.waitForSelector('#F1\\:password', {
+        state: 'attached',
         timeout: 45_000,
       });
-      await page.type('#F1\\:password', password);
+      await this.typeInto(page, '#F1\\:password', password);
       this.logger.log('Clicking login button...');
       // await new Promise((resolve) => setTimeout(resolve, 2000_000));
       const idCaptcha = '#captcha img';
       let captcha: ElementHandle | null = null;
       try {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
-        captcha = await page.waitForSelector(idCaptcha, { timeout: 10_000 });
+        captcha = await page.waitForSelector(idCaptcha, {
+          state: 'attached',
+          timeout: 10_000,
+        });
       } catch (e) {
-        if (e instanceof TimeoutError) {
+        if (e instanceof errors.TimeoutError) {
           this.logger.warn('No se encontró el captcha (timeout)');
         } else {
           this.logger.warn('Error esperando el captcha', e);
@@ -1621,7 +1835,7 @@ export class ScrapperService {
         const el = document.querySelector<HTMLInputElement>('#F1\\:password');
         if (el) el.value = '';
       });
-      await page.type('#F1\\:password', password);
+      await this.typeInto(page, '#F1\\:password', password);
       await page.click('#F1\\:btnIngresar');
       await new Promise((resolve) => setTimeout(resolve, 4_000));
       const claveIncorrecta = await page
@@ -1649,6 +1863,7 @@ export class ScrapperService {
       await new Promise((resolve) => setTimeout(resolve, delay));
       await page.waitForFunction(() => document.readyState === 'complete');
       await page.waitForSelector(selector, {
+        state: 'attached',
         timeout: 16_000,
       });
     } catch (error: unknown) {
