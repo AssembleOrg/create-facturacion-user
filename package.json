@@ -27,7 +27,6 @@
     "@nestjs/swagger": "^11.2.0",
     "@nestjs/typeorm": "^11.0.0",
     "@supabase/supabase-js": "^2.49.10",
-    "better-sqlite3": "^11.10.0",
     "class-validator": "^0.14.2",
     "compression": "^1.7.5",
     "dotenv": "^16.5.0",

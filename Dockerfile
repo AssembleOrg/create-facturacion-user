@@ -8,10 +8,11 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # 1) tini como PID 1: cosecha los procesos huérfanos de Chromium (sin él quedan
 #    zombies ocupando PIDs hasta agotar pids.max del contenedor).
-#    python3/make/g++: better-sqlite3 11.x no publica binario precompilado para
-#    Node 24 (el de la imagen) y lo compila con node-gyp durante npm install.
+#    python3/make/g++/setuptools: red por si sqlite3 no encuentra binario
+#    precompilado y compila con node-gyp (el node-gyp viejo que trae importa
+#    distutils, que Python 3.12 ya no incluye: setuptools lo provee).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends tini python3 make g++ && \
+    apt-get install -y --no-install-recommends tini python3 python3-setuptools make g++ && \
     rm -rf /var/lib/apt/lists/*
 
 # 2) Crea el directorio de trabajo
